@@ -1,5 +1,24 @@
-venv/
-__pycache__
-.git/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual Environment
+# This should be the path to your virtual environment directory
+.venv/
+
+# BunTool-specific
+# These directories contain user-uploaded files, logs, and final outputs.
+# Ignoring them is critical for privacy and to keep the repository clean.
 tempfiles/
 logs/
+bundles/
+memory-bank/
+
+# IDE / Editor specific files
+.vscode/
+.idea/
+
+# macOS
+.DS_Store

@@ -5,7 +5,7 @@ import os
 import bundle as buntool
 import shutil
 import logging
-from datetime import datetime
+import tempfile
 import uuid
 from waitress import serve
 import csv
@@ -29,21 +29,13 @@ def is_running_in_lambda():
 
 
 if is_running_in_lambda():
-    logs_dir = '/tmp/logs'
+    logs_dir = os.path.join(tempfile.gettempdir(), 'logs')
 else:
     logs_dir = os.path.join('logs')
-if not os.path.exists(logs_dir):
-    os.makedirs(logs_dir)
+os.makedirs(logs_dir, exist_ok=True)
 
-# Configure logging
-# # Configure upload folder and bundles output folder
-# UPLOAD_FOLDER = 'uploads'
-# if not os.path.exists(UPLOAD_FOLDER):
-#     os.makedirs(UPLOAD_FOLDER)
-
-BUNDLES_DIR = '/tmp/bundles'
-if not os.path.exists(BUNDLES_DIR):
-    os.makedirs(BUNDLES_DIR)
+BUNDLES_DIR = os.path.join(tempfile.gettempdir(), 'buntool', 'bundles')
+os.makedirs(BUNDLES_DIR, exist_ok=True)
 
 
 def save_uploaded_file(file, directory, filename=None):
@@ -152,7 +144,7 @@ def create_bundle():
     if request.method == 'GET':
         return render_template('index.html')
 
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    timestamp = buntool.datetime.now().strftime('%Y%m%d_%H%M%S')
     session_id = str(uuid.uuid4())[:8]
     user_agent = request.headers.get('User-Agent')
     app.logger.debug(f"******************APP HEARS A CALL******************")
@@ -166,15 +158,9 @@ def create_bundle():
 
     try:
         # Create temporary working directory in /tmp/tempfiles/{session_id}:
-        if is_running_in_lambda():
-            temp_dir = os.path.join('/tmp', 'tempfiles', session_id)
-            if not os.path.exists('/tmp/tempfiles'):
-                os.makedirs('/tmp/tempfiles')
-        else:
-            temp_dir = os.path.join('tempfiles', session_id)
-            if not os.path.exists('tempfiles'):
-                os.makedirs('tempfiles')
-        os.makedirs(temp_dir)
+        base_dir = tempfile.gettempdir() if is_running_in_lambda() else '.'
+        temp_dir = os.path.join(base_dir, 'tempfiles', session_id)
+        os.makedirs(temp_dir, exist_ok=True)
         app.logger.debug(f"Temporary directory created: {temp_dir}")
 
         # Add FileHandler for session-specific logging

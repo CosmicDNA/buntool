@@ -58,6 +58,7 @@ import shutil
 import csv
 import logging
 import zipfile
+import tempfile
 from datetime import datetime
 from werkzeug.utils import secure_filename
 
@@ -83,6 +84,11 @@ def configure_logger(session_id=None):
     global session_file_handler
     global bundle_logger
     bundle_logger = logging.getLogger('bundle_logger')
+
+    # Clear existing handlers to prevent duplicate logs on subsequent runs
+    if bundle_logger.hasHandlers():
+        bundle_logger.handlers.clear()
+
     bundle_logger.setLevel(logging.DEBUG)
     bundle_logger.propagate = False
     formatter = logging.Formatter('%(asctime)s-%(levelname)s-[BUN]: %(message)s')
@@ -99,18 +105,6 @@ def configure_logger(session_id=None):
     session_file_handler.setFormatter(formatter)
     bundle_logger.addHandler(session_file_handler)
     return bundle_logger
-
-
-def remove_session_file_handler():
-    '''
-    This is meant to prevent duplicate logs, but
-    it's imperfect for several bundles created during the same user session.
-    Not a priority to fix right now.
-    '''
-    global session_file_handler
-    if session_file_handler:
-        bundle_logger.removeHandler(session_file_handler)
-        session_file_handler = None
 
 
 def remove_temporary_files(list_of_temp_files):
@@ -1295,11 +1289,11 @@ def add_footer_to_bundle(input_file, page_numbers_pdf_path, output_file):
 
         # Overlay page numbers PDF pages onto input PDF pages
         for input_page, overlay_page in zip(input_pdf.pages, page_numbers_pdf.pages):
-            # get page of input page
-            input_page_size = input_page.mediabox
-            scaling_factor = overlay_page_size[2] / input_page_size[2]
-            overlay_page.merge_scaled_page(input_page, scaling_factor)
-            writer.add_page(overlay_page)
+            # The content is `input_page`, the footer is `overlay_page`.
+            # We merge the footer ONTO the content page, scaling it to match the width.
+            scaling_factor = float(input_page.mediabox.width / overlay_page.mediabox.width)
+            input_page.merge_scaled_page(overlay_page, scaling_factor)
+            writer.add_page(input_page)
 
         # Write the resulting PDF to the output file
         with open(output_file, "wb") as f:
@@ -1650,8 +1644,9 @@ class BundleConfig:
         self.expected_length_of_frontmatter = expected_length_of_frontmatter if expected_length_of_frontmatter else 0
         self.main_page_count = main_page_count if main_page_count else 0
         self.total_number_of_pages = self.main_page_count + self.expected_length_of_frontmatter
-        self.temp_dir = temp_dir if temp_dir else os.path.join('/tmp', 'tempfiles', self.session_id)
-        self.logs_dir = logs_dir if logs_dir else os.path.join('/tmp', 'logs', self.session_id)
+        base_temp = tempfile.gettempdir()
+        self.temp_dir = temp_dir if temp_dir else os.path.join(base_temp, 'buntool', 'tempfiles', self.session_id)
+        self.logs_dir = logs_dir if logs_dir else os.path.join(base_temp, 'buntool', 'logs', self.session_id)
         self.bookmark_setting = bookmark_setting if bookmark_setting else "uk_abbreviated"
 
 def create_bundle(input_files, output_file, coversheet, index_file, bundle_config_data):
@@ -1666,13 +1661,13 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
     # various initial file and data handling:
     load_bundle_config(bundle_config_data)  # make this data globally available
     temp_dir = bundle_config.temp_dir
-    if not temp_dir:
-        temp_dir = os.path.join("/tmp", "tempfiles", bundle_config.session_id)
     os.makedirs(temp_dir, exist_ok=True)
     output_file = secure_filename(output_file)
     tmp_output_file = os.path.join(temp_dir, output_file)
     coversheet_path = os.path.join(temp_dir, coversheet) if coversheet else None
     list_of_temp_files = []
+    toc_file_path = None
+    docx_output_path = None
 
     # set up logging using configure_logger function
     bundle_logger = configure_logger(bundle_config.session_id)
@@ -2126,8 +2121,6 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
                 f"[CB]..Remaining temporary files (will be deleted on next system flush): {remaining_files}")
         else:
             bundle_logger.info(f"[CB]..All temporary files deleted successfully.")
-        # Remove the handler to prevent duplicate logs
-        remove_session_file_handler()
 
     return tmp_output_file, zip_filepath
 
