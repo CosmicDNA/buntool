@@ -30,8 +30,8 @@ Buntool uses the font Charter, a popular style of font for legal documents. The 
 
 ```bash
 # This command copies the fonts into your virtual environment.
-# The python* wildcard makes it work for any version of Python 3.
-# cp static/Charter*.ttf .venv/lib/python*/site-packages/reportlab/fonts/
+# The python* wildcard makes it work for any version of Python 3 
+cp static/Charter*.ttf ./venv/lib/python*/site-packages/reportlab/fonts/
 ```
 
 ## Ready to bake
@@ -42,6 +42,8 @@ python app.py
 ```
 Then visit `http://127.0.0.1:7001` in your browser.
 
-# License
+# Copyright and License
+
+Copyright © Tristan Sherliker and contributors to BunTool
 
 Licensed under the Mozilla Public License, version 2.0.
