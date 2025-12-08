@@ -242,31 +242,26 @@ bundleForm.addEventListener('submit', function (e) {
 
     const formData = new FormData(this);
 
-    // Clear any existing file entries
-    for (let key of formData.keys()) {
-        if (key === 'files') {
-            formData.delete(key);
-        }
-    }
+    // Clear any existing 'files' entries before adding the sorted ones
+    formData.delete('files');
 
-    // Add files in the order they appear in the sortable list
-    const rows = fileList.querySelectorAll('tr');
-    rows.forEach(row => {
-        if (!row.classList.contains('section-row')) {
+    // Build the list of files to append using a more functional approach
+    const filesToAppend = Array.from(fileList.querySelectorAll('tr'))
+        .filter(row => !row.classList.contains('section-row'))
+        .map(row => {
             const originalName = row.querySelector('td[data-original-name]').dataset.originalName;
             const file = uploadedFiles.get(originalName);
-            if (file) {
-                const sanitizedName = filenameMappings.get(file.name);
-                if (sanitizedName) {
-                    const sanitizedFile = new File([file], sanitizedName, {
-                        type: file.type,
-                        lastModified: file.lastModified
-                    });
-                    formData.append('files', sanitizedFile);
-                }
+            const sanitizedName = filenameMappings.get(file?.name);
+            if (file && sanitizedName) {
+                return new File([file], sanitizedName, { type: file.type, lastModified: file.lastModified });
             }
-        }
-    });
+            return null;
+        })
+        .filter(Boolean); // Filter out any null values from failed mappings
+
+    // Append the collected files to formData
+    filesToAppend.forEach(file => formData.append('files', file));
+
     // Generate and append the CSV file
     const csvContent = generateCSVContent();
     const csvBlob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8' });

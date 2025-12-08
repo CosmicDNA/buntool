@@ -1,26 +1,36 @@
+from dataclasses import dataclass
+
 from docx import Document
+from docx.document import Document as DocumentObject
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-from docx.oxml import parse_xml, OxmlElement
-from docx.oxml.ns import qn, nsdecls
-from docx.shared import Pt, RGBColor, Mm
+from docx.shared import Pt, RGBColor
 
-def create_toc_docx(toc_entries, casedetails, output_file_path, confidential=False, date_setting=True, index_font_setting=None):
-    # Create a new Word document
-    doc = Document()
 
+@dataclass
+class DocxConfig:
+    """Configuration for DOCX Table of Contents generation."""
+
+    confidential: bool = False
+    date_setting: bool = True
+    index_font_setting: str | None = None
+
+
+def _setup_document_style(doc: DocumentObject, index_font_setting):
     style = doc.styles['Normal']
     #parse font setting same as in bundle.py:
-    # if font = 
+    # if font =
     # style.font.name = 'Times New Roman'
     if index_font_setting == "sans":
-        style.font.name = "Arial"
+        style.font.name = "Arial"  # type: ignore
     elif index_font_setting == "serif":
-        style.font.name = "Times New Roman"
+        style.font.name = "Times New Roman"  # type: ignore
     elif index_font_setting == "mono":
-        style.font.name = "Courier New"
+        style.font.name = "Courier New"  # type: ignore
     else:
-        style.font.name = "Times New Roman"
+        style.font.name = "Times New Roman"  # type: ignore
 
+
+def _add_docx_header(doc: DocumentObject, casedetails: list[str], confidential):
     # Set up case details
     claimno_hdr = casedetails[1] if casedetails[1] else ""
     casename = casedetails[2] if casedetails[2] else ""
@@ -50,45 +60,11 @@ def create_toc_docx(toc_entries, casedetails, output_file_path, confidential=Fal
             run.font.color.rgb = RGBColor(255, 0, 0)
             run.text = f"CONFIDENTIAL\n{bundle_name}"
 
+
+def _create_and_populate_table(doc: DocumentObject, toc_entries, date_setting):
 # Table of Contents header row
     table = doc.add_table(rows=1, cols=4)
-    table.style = 'Table Grid'  
-    table.autofit = False
-    table.allow_autofit = False
-    
-    # Set preferred widths in millimeters
-    width_distribution = [Mm(14), Mm(95), Mm(35), Mm(17)]
-        # ('12mm', 12),
-        # ('100mm', 100),
-        # ('35mm', 35),
-        # ('12mm', 12)
-    #]
-
-    for row in table.rows:
-        for idx, width in enumerate(width_distribution):
-            table.columns[idx].width=(width)
-
-# # Set fixed layout and overall table width
-#     tbl = table._element
-#     tblPr = tbl.get_or_add_tblPr()
-#     tblLayout = OxmlElement('w:tblLayout')
-#     tblLayout.set(qn('w:type'), 'fixed')
-#     tblPr.append(tblLayout)
-
-#     tcW = OxmlElement('w:tcW')
-#     tcW.set(qn('w:w'), str(int(159 * 50800 / 25.4)))  # Total width in twips
-#     tcW.set(qn('w:type'), 'dxa')
-#     tblPr.append(tcW)
-
-#     # Set column widths
-#     for row in table.rows:
-#         for idx, cell in enumerate(row.cells):
-#             tcPr = cell._element.get_or_add_tcPr()
-#             tcW = OxmlElement('w:tcW')
-#             tcW.set(qn('w:w'), str(int(width_distribution[idx][1] * 50800 / 25.4)))  # Convert mm to twips
-#             tcW.set(qn('w:type'), 'dxa')
-#             tcPr.append(tcW)
-
+    table.style = 'Table Grid'
 
     header_cells = table.rows[0].cells
     header_cells[0].text = "Tab"
@@ -102,22 +78,34 @@ def create_toc_docx(toc_entries, casedetails, output_file_path, confidential=Fal
 
     # Add entries to the Table of Contents
     for entry in toc_entries:
+        # Skip the header row if it's present in the data
+        if "Tab" in entry[0] and "Title" in entry[1]:
+            continue
+
         row = table.add_row().cells
         if "SECTION_BREAK" in entry[0]:
             # Handle section breaks
-            para = doc.add_paragraph(entry[1])
-            para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-            if para.runs:
-                run = para.runs[0]
-                run.bold = True
-                run.font.size = Pt(12)
             row[0].merge(row[-1])  # Merge all cells for a section header
+            para = row[0].paragraphs[0]
+            run = para.add_run(entry[1])
+            run.bold = True
+            run.font.size = Pt(12)
+            para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
         else:
             # Add a regular TOC entry
             row[0].text = str(entry[0])  # Tab
             row[1].text = entry[1]      # Title
             row[2].text = entry[2] if date_setting else ""  # Date
             row[3].text = str(entry[3])  # Page
+
+
+def create_toc_docx(toc_entries, casedetails: list[str], output_file_path, config: DocxConfig):
+    """Creates a Table of Contents in a .docx file."""
+    doc = Document()
+
+    _setup_document_style(doc, config.index_font_setting)
+    _add_docx_header(doc, casedetails, config.confidential)
+    _create_and_populate_table(doc, toc_entries, config.date_setting)
 
     # Save the document
     doc.save(output_file_path)
@@ -136,6 +124,6 @@ if __name__ == "__main__":
     casedetails = ["Bundle Name", "Claim Number", "Case Name"]
     output_file_path = "TOC.docx"
 
+    docx_config = DocxConfig(confidential=True, date_setting=False)
     # Create the TOC document
-    create_toc_docx(toc_entries, casedetails, output_file_path, confidential=True, date_setting=False)
-    print(f"Table of Contents saved to '{output_file_path}'")
+    create_toc_docx(toc_entries, casedetails, output_file_path, docx_config)
