@@ -33,16 +33,16 @@
 
         <div class="intro-section" style="background-color: #f8fcff; padding: 1rem; text-align: left;">
             <h2> Welcome to BunTool! </h2>
-            <p> 
-                BunTool is a simple tool for creating PDF bundles from several PDF files. 
+            <p>
+                BunTool is a simple tool for creating PDF bundles from several PDF files.
             </p>
             <p>
-                Written by a lawyer for use in court, it's perfect for 
-                making court bundles in the English court system. The tool will automatically tab, index, paginate, hyperlink and bookmark the output file in a few seconds. 
-                The default settings comply with the guidance for most courts, but there are lots of options to customise the output. 
+                Written by a lawyer for use in court, it's perfect for
+                making court bundles in the English court system. The tool will automatically tab, index, paginate, hyperlink and bookmark the output file in a few seconds.
+                The default settings comply with the guidance for most courts, but there are lots of options to customise the output.
             </p>
             <p>
-                Just enter the details, upload your files, choose any options, and click "Create Bundle" below. The PDFs will be combined,  
+                Just enter the details, upload your files, choose any options, and click "Create Bundle" below. The PDFs will be combined,
             </p>
         </div>
 
@@ -87,13 +87,13 @@
                 <p>Click the button to add section markers.</p>
                 <p>Check and edit the titles and dates for the index: BunTool will suggest some automatically. </p>
 
-                <div id="dropZone" class="upload-zone" style="display: block;">
+                <label for="fileInput" id="dropZone" class="upload-zone" style="display: block; cursor: pointer;">
                     <i class="mdi mdi-upload upload-icon" style="color: #d57782;"></i>
                     <p><span style="color: #d57782; font-size: 1.2rem;"><b>Upload your PDFs here:</b> Click to select,
                             or
                             drag and drop</p></span>
-                    <input type="file" id="fileInput" name="files" multiple accept=".pdf" style="display: block;">
-                </div>
+                </label>
+                <input type="file" id="fileInput" name="files" multiple accept=".pdf" style="display: none;">
                 <div class="progress-container">
                     <div class="progress-bar"></div>
                 </div>
@@ -180,7 +180,7 @@
                                         </div>
                                         <div class="form-check">
                                             <input class="form-check-input" type="radio" id="indexFontTraditional"
-                                                name="index_font" value="traditional" 
+                                                name="index_font" value="traditional"
                                                 style="vertical-align: middle; margin-right: 5px;">
                                             <label class="form-check-label" for="indexFontTraditional"
                                                 style="font-family: Charter Regular; display: inline;">Charter (similar to MS Georgia)</label>
@@ -278,7 +278,7 @@
                                         </div>
                                         <div class="form-check">
                                             <input class="form-check-input" type="radio" id="footerFontTraditional"
-                                                name="footer_font" value="traditional" 
+                                                name="footer_font" value="traditional"
                                                 style="vertical-align: middle; margin-right: 5px;">
                                             <label class="form-check-label" for="footerFontTraditional"
                                                 style="font-family: Charter Regular; display: inline;">Charter (similar to MS Georgia)</label>
@@ -341,7 +341,7 @@
                 </div>
 
                 </div>
-            
+
             <div class="card">
                 <div class="card-header">
                     <div class="card-icon">
@@ -375,12 +375,12 @@
                 Some logs are stored, including: the number of files uploaded, the number of pages in each file, the number of bundles created, and any text input for the index. This is all just to make sure the app is functioning correctly, and diagnose any errors. Logs are deleted regularly, though less often than the main data itself.
                 BunTool also logs the type of browser you're using. You can review the code on <a href="https://github.com/TrisSherliker/buntool">GitHub</a>. As with most open-source tools, it is free to use but comes with no warranty.</p>
                 <p>
-                    If you find this useful, have any suggestions, or need help with any errors, I'd like to hear from you. You can contact me <a href="mailto:tris@sherliker.net">by email here</a>. 
+                    If you find this useful, have any suggestions, or need help with any errors, I'd like to hear from you. You can contact me <a href="mailto:tris@sherliker.net">by email here</a>.
                 </p>
             </div>
     </div>
     <!-- Add the duplicate file popup modal -->
-    <div id="duplicateModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; 
+    <div id="duplicateModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
     background-color: rgba(0,0,0,0.5); justify-content: center; align-items: center;">
         <div
             style="background-color: #fff; padding: 1.5rem; border-radius: 0.5rem; max-width: 400px; text-align: center;">

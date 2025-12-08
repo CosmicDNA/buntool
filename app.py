@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, send_file, session
+from flask import Flask, render_template, request, jsonify, send_file
 from werkzeug.utils import secure_filename
 import os
 # import sys
@@ -45,7 +45,11 @@ def save_uploaded_file(file, directory, filename=None):
     # saves the file to the filepath
     # returns the filepath if successful, None if not.
     if file and file.filename:
-        filename = secure_filename(filename) or secure_filename(file.filename)
+        # Prioritize the provided filename, otherwise use the file's original name.
+        # This ensures a non-None string is passed to secure_filename.
+        name_to_secure = filename if filename else file.filename
+        filename = secure_filename(name_to_secure)
+
         filepath = os.path.join(directory, filename)
         file.save(filepath)
         app.logger.debug(f"Saved file: {filepath}")
@@ -92,7 +96,7 @@ def synchronise_csv_index(uploaded_csv_path, filename_mappings):
                 reader = csv.reader(infile)
                 writer = csv.writer(outfile)
                 # print content of input csv:
-                app.logger.debug(f"Reading input CSV:")
+                app.logger.debug("Reading input CSV:")
                 # try:
                 #     header = next(reader)
                 #     app.logger.debug(f"[APP]-- Read header: {header}")
@@ -106,11 +110,11 @@ def synchronise_csv_index(uploaded_csv_path, filename_mappings):
                     app.logger.debug(f"Processing row: {row}")
                     try:
                         if row[0] == 'Filename' and row[2] == 'Page':
-                            app.logger.debug(f"..Found header row")
+                            app.logger.debug("..Found header row")
                             writer.writerow(row)
                             continue
                         if len(row) > 3 and row[3] == '1':
-                            app.logger.debug(f"..Found section marker row")
+                            app.logger.debug("..Found section marker row")
                             writer.writerow(row)
                             continue
 
@@ -147,14 +151,16 @@ def create_bundle():
     timestamp = buntool.datetime.now().strftime('%Y%m%d_%H%M%S')
     session_id = str(uuid.uuid4())[:8]
     user_agent = request.headers.get('User-Agent')
-    app.logger.debug(f"******************APP HEARS A CALL******************")
+    app.logger.debug("******************APP HEARS A CALL******************")
     app.logger.debug(f"New session ID: {session_id} {user_agent}")
     # check if csv has been passed:
 
     # check whether input files are actually povided:
     if 'files' not in request.files:
-        app.logger.error(f"Cannot create bundle: No files found in form submission")
+        app.logger.error("Cannot create bundle: No files found in form submission")
         return jsonify({"status": "error", "message": "No files found. Please add files and try again."})
+
+    session_file_handler = None
 
     try:
         # Create temporary working directory in /tmp/tempfiles/{session_id}:
@@ -173,12 +179,12 @@ def create_bundle():
 
         # Get form data
         # Ingest csv index
-        app.logger.debug(f"Ingesting form information...")
+        app.logger.debug("Ingesting form information...")
         if request.files.get('csv_index'):
-            app.logger.info(f"..index file found in form submission")
+            app.logger.info("..index file found in form submission")
             app.logger.info(f"..index data: {request.files.get('csv_index')}")
         else:
-            app.logger.info(f"..No CSV index found.")
+            app.logger.info("..No CSV index found.")
 
         # ingest other form data:
         bundle_title = request.form.get('bundle_title', 'Bundle') if request.form.get('bundle_title') else 'Bundle'
@@ -191,16 +197,16 @@ def create_bundle():
         footer_prefix = request.form.get('footer_prefix')
         confidential_bool = request.form.get('confidential_bool')
         date_setting = request.form.get('date_setting')
-        roman_for_preface = bool(strtobool(request.form.get('roman_for_preface')))
+        roman_for_preface = strtobool(request.form.get('roman_for_preface', 'false'))
         case_details = [bundle_title, claim_no, case_name]
         zip_bool = True  # option not implemented for GUI control.
-        bookmark_setting = request.form.get('bookmark_setting')
+        bookmark_setting = request.form.get('bookmark_setting', 'tab-title')
 
-        output_file = get_output_filename(bundle_title, case_name, timestamp, footer_prefix)
+        output_file = get_output_filename(bundle_title, case_name, timestamp, footer_prefix or "Bundle")
         app.logger.debug(f"generated output filename: {output_file}")
 
         # Save uploaded files
-        app.logger.debug(f"Gathering uploaded files...")
+        app.logger.debug("Gathering uploaded files...")
         files = request.files.getlist('files')
         # check whether files exceed max allowed overall size of MAX_CONTENT_LENGTH:
         total_size = sum([f.content_length for f in files])
@@ -218,20 +224,19 @@ def create_bundle():
                 secure_name = secure_filename(file.filename)
                 filename_mappings[file.filename] = secure_name
                 # app.logger.debug(f"[{session_id}-{timestamp}-APP]--filename_mappings: {filename_mappings}")
-                filepath = save_uploaded_file(file, temp_dir, secure_name)
-                if filepath:
-                    input_files.append(filepath)
+                saved_path = save_uploaded_file(file, temp_dir, secure_name)
+                if saved_path and os.path.exists(saved_path):
+                    input_files.append(saved_path)
+                    app.logger.info(f"..File saved to: {saved_path}")
+                else:
+                    app.logger.error(f"File not found or failed to save at path: {saved_path}")
             else:
                 app.logger.error(f"..No filename found for {file}")
-            if not os.path.exists(filepath):
-                app.logger.error(f"File not found at: {filepath}")
-            else:
-                app.logger.info(f"..File saved to: {filepath}")
 
         # Save coversheet if provided
         secure_coversheet_filename = None
         if 'coversheet' in request.files and request.files['coversheet'].filename != '':
-            app.logger.debug(f"Coversheet found in form submission")
+            app.logger.debug("Coversheet found in form submission")
             cover_file = request.files['coversheet']
             # if cover_file and cover_file.filename:
             # Generate a secure and unique filename for coversheet
@@ -239,7 +244,7 @@ def create_bundle():
             coversheet_filepath = save_uploaded_file(cover_file, temp_dir, secure_coversheet_filename)
             app.logger.debug(f"Coversheet path: {coversheet_filepath}")
         else:
-            app.logger.debug(f"No coversheet found in form submission")
+            app.logger.debug("No coversheet found in form submission")
 
         # Save CSV index
         saved_csv_path = ""
@@ -249,27 +254,27 @@ def create_bundle():
             if csv_file and csv_file.filename:
                 secure_csv_filename = secure_filename(f'index_{session_id}_{timestamp}.csv')
                 saved_csv_path = save_uploaded_file(csv_file, temp_dir, secure_csv_filename)
-                # if secure_csv_path:
-                # permanent_csv_path = os.path.join(temp_dir, secure_csv_filename)
+                if not saved_csv_path or not os.path.exists(saved_csv_path):
+                    app.logger.error(f"CSV file not found or failed to save at path: {saved_csv_path}")
+                    return jsonify(
+                        {"status": "error", "message": f"Index data did not upload correctly. Session code: {session_id}"}), 400
+
+                app.logger.debug(f"CSV saved to: {saved_csv_path}")
                 sanitised_filenames_index_csv = synchronise_csv_index(saved_csv_path, filename_mappings)
+            else:
+                sanitised_filenames_index_csv = None
         else:
-            app.logger.debug(f"No CSV index found in form submission")
+            app.logger.debug("No CSV index found in form submission")
             sanitised_filenames_index_csv = None
-        if not os.path.exists(saved_csv_path):
-            app.logger.error(f"CSV file not found at: {saved_csv_path}")
-            return jsonify(
-                {"status": "error", "message": f"Index data did not upload correctly. Session code: {session_id}"}), 400
-        else:
-            app.logger.debug(f"CSV saved to: {saved_csv_path}")
 
         # Create bundle - main function call
         try:
-            app.logger.info(f"Calling buntool.create_bundle with params:")
+            app.logger.info("Calling buntool.create_bundle with params:")
             app.logger.info(f"....input_files: {input_files}")
             app.logger.info(f"....output_file: {output_file}")
             app.logger.info(f"....secure_coversheet_filename: {secure_coversheet_filename}")
             app.logger.info(f"....sanitised_filenames_index_csv: {sanitised_filenames_index_csv}")
-            app.logger.info(f"....bundle_config elements:")
+            app.logger.info("....bundle_config elements:")
             app.logger.info(f"........timestamp: {timestamp}")
             app.logger.info(f"........case_details: {case_details}")
             app.logger.info(f"........confidential_bool: {confidential_bool}")
@@ -378,12 +383,12 @@ def create_bundle():
 def download_bundle():
     bundle_path = request.args.get('path')
     if not bundle_path:
-        return jsonify({"status": "error", "message": f"Download Error: Bundle download path could not be found."}), 400
+        return jsonify({"status": "error", "message": "Download Error: Bundle download path could not be found."}), 400
 
     absolute_path = os.path.abspath(bundle_path)
     if not os.path.exists(absolute_path):
         return jsonify(
-            {"status": "error", "message": f"Download Error: bundle does not exist in expected location."}), 404
+            {"status": "error", "message": "Download Error: bundle does not exist in expected location."}), 404
 
     return send_file(absolute_path, as_attachment=True)
 
@@ -392,15 +397,15 @@ def download_bundle():
 def download_zip():
     zip_path = request.args.get('path')
     if not zip_path:
-        return jsonify({"status": "error", "message": f"Download Error: Zip download path could not be found."}), 400
+        return jsonify({"status": "error", "message": "Download Error: Zip download path could not be found."}), 400
 
     absolute_path = os.path.abspath(zip_path)
     if not os.path.exists(absolute_path):
-        return jsonify({"status": "error", "message": f"Download Error: zip does not exist in expected location."}), 404
+        return jsonify({"status": "error", "message": "Download Error: zip does not exist in expected location."}), 404
 
     return send_file(absolute_path, as_attachment=True)
 
 
 if __name__ == '__main__':
-    app.logger.debug(f"APP - Server started on port 7001 -- Hello.")
+    app.logger.debug("APP - Server started on port 7001 -- Hello.")
     serve(app, host='0.0.0.0', port=7001, threads=4, connection_limit=100, channel_timeout=120)

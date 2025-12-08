@@ -26,7 +26,7 @@ new Sortable(fileList, {
 });
 
 // Event Listeners
-dropZone.addEventListener('click', () => fileInput.click());
+// The click listener for dropZone has been removed as it was redundant. The <label> in the HTML now correctly handles opening the file dialog.
 
 dropZone.addEventListener('dragover', (e) => {
     e.preventDefault();
@@ -143,7 +143,7 @@ function addFileToList(fileData) {
     console.log("Parsed result:", parsedResult.date, parsedResult.titleWithoutDate);
     const dateToDisplay = parsedResult.date ? parsedResult.date : fileData.date;
     const titleToDisplay = parsedResult.titleWithoutDate || fileData.title;
-    
+
     row.innerHTML = `
         <td><div class="drag-handle"><span style="background-color: #68b3cd; color: white; padding: 0.2rem 0.5rem; border-radius: 0.3rem;">☰</span></div></td>
         <td data-original-name="${fileData.originalName}">${fileData.sanitizedName}</td>
@@ -398,13 +398,13 @@ function parseDateFromFilename(filename, title) {
     // Check for filenames that start with YYYY-MM-DD or DD-MM-YYYY
     const year_first_regex = /[\[\(]{0,1}(1\d{3}|20\d{2})[-._]?(0[1-9]|1[0-2])[-._]?(0[1-9]|[12][0-9]|3[01])[\]\)]{0,1}/;
     const year_last_regex = /[\[\(]{0,1}(0[1-9]|[12][0-9]|3[01])[-._]?(0[1-9]|1[0-2])[-._]?(1\d{3}|20\d{2})[\]\)]{0,1}/;
-    
+
     const year_first_match = filename.match(year_first_regex);
     if (year_first_match) {
         const [fullMatch, year, month, day] = year_first_match;
         const parsedDate = new Date(`${year}-${month}-${day}T00:00:00Z`);
         matchedDate = parsedDate.toISOString().split('T')[0];
-        
+
         if (titleWithoutDate) {
             // Remove the matched date (including any brackets) and trim remaining separators
             titleWithoutDate = titleWithoutDate.replace(fullMatch, '').replace(/^[\s-_]+|[\s-_]+$/g, '');
@@ -418,7 +418,7 @@ function parseDateFromFilename(filename, title) {
         const [fullMatch, day, month, year] = year_last_match;
         const parsedDate = new Date(`${year}-${month}-${day}T00:00:00Z`);
         matchedDate = parsedDate.toISOString().split('T')[0];
-        
+
         if (titleWithoutDate) {
             // Remove the matched date (including any brackets) and trim remaining separators
             titleWithoutDate = titleWithoutDate.replace(fullMatch, '').replace(/^[\s-_]+|[\s-_]+$/g, '');
@@ -445,15 +445,15 @@ function sortTable(columnIndex) {
     const rows = Array.from(table.getElementsByTagName('tr'));
     const headers = document.querySelectorAll('th.sortable');
     const currentHeader = headers[columnIndex - 2]; // Adjust for first two non-sortable columns
-    
+
     // Determine sort direction
     const isAsc = !currentHeader.classList.contains('asc');
-    
+
     // Reset other headers
     headers.forEach(header => {
         header.classList.remove('asc', 'desc');
     });
-    
+
     // Set current header sort direction
     currentHeader.classList.toggle('asc', isAsc);
     currentHeader.classList.toggle('desc', !isAsc);
@@ -474,8 +474,8 @@ function sortTable(columnIndex) {
             return isAsc ? aDate - bDate : bDate - aDate;
         } else {
             // Regular string comparison
-            return isAsc ? 
-                aValue.localeCompare(bValue) : 
+            return isAsc ?
+                aValue.localeCompare(bValue) :
                 bValue.localeCompare(aValue);
         }
     });
