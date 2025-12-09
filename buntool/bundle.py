@@ -1475,10 +1475,17 @@ class AddHyperlinksParams(NamedTuple):
     roman_page_labels: bool = False
 
 
-def add_hyperlinks(add_hyperlinks_params: AddHyperlinksParams):
-    """Add hyperlinks to the table of contents pages.
+def add_hyperlinks(
+        pdf_file,
+        output_file,
+        length_of_coversheet,
+        length_of_frontmatter,
+        toc_entries
+):
+    """Add Hyperlinks to the table of contents pages.
 
-    The PDF standard defines these as rectangular areas with an action to jump to a destination within the document.
+    The PDF standard defines these as
+    rectangular areas with an action to jump to a destination within the document.
 
     This means we need to know the coordinates of the rectangles. That is the main
     job of this function: to find rectangle coordinates.
@@ -1490,41 +1497,49 @@ def add_hyperlinks(add_hyperlinks_params: AddHyperlinksParams):
     - find that search string in the extracted text; thus, find the coordinates on the page.
     - pass off to the annotation writer for actual writing.
     """
-    pdf_file = add_hyperlinks_params.pdf_file
-    output_file = add_hyperlinks_params.output_file
-    length_of_coversheet = add_hyperlinks_params.length_of_coversheet
-    length_of_frontmatter = add_hyperlinks_params.length_of_frontmatter
-    toc_entries = add_hyperlinks_params.toc_entries
-    date_setting = add_hyperlinks_params.date_setting
-    roman_page_labels = add_hyperlinks_params.roman_page_labels
-
     bundle_logger.debug("[HYP]Starting hyperlink addition")
+    scraped_pages_text = []
+    list_of_annotation_coords = []
 
     # Step 1: Extract text and coordinates from TOC
     with pdfplumber.open(pdf_file) as pdf:
-        scraped_pages_text = [pdf.pages[idx].extract_text_lines() for idx in range(length_of_coversheet, length_of_frontmatter)]
+        for idx in range(length_of_coversheet, length_of_frontmatter):
+            current_page = pdf.pages[idx]
+            bundle_logger.debug(f"[HYP]..Processing page {idx} for TOC text extraction")
+            scraped_toc_text = current_page.extract_text_lines()
+            scraped_pages_text.append(scraped_toc_text)
 
-    # Step 2: Build a list of annotations using a list comprehension
-    list_of_annotation_coords = [
-        match
-        for entry in toc_entries
-        if "SECTION_BREAK" not in entry[0]
-        and entry[3] != "Page"
-        and (
-            match := _find_hyperlink_match_for_entry(
-                FindHyperlinkMatchForEntryParams(
-                    entry, scraped_pages_text, length_of_coversheet, length_of_frontmatter, date_setting, roman_page_labels
-                )
-            )
-        )
-    ]
+    # Step 2: Match TOC entries to text and get coordinates
+    for entry in toc_entries:
+        bundle_logger.debug(f"[HYP]..Processing TOC entry: {entry}")
+
+        # Skip section breaks and header rows
+        if "SECTION_BREAK" in entry[0] or (len(entry) > 3 and str(entry[3]) == "Page"):
+            continue
+
+        tab_to_find = str(entry[0])
+        found_match = False
+        bundle_logger.debug(f"[HYP]....Searching for tab: '{tab_to_find}'")
+
+        for page_idx, page_words in enumerate(scraped_pages_text, start=length_of_coversheet):
+            for line in page_words:
+                line_text = str(line.get("text", ""))
+                if line_text.strip().startswith(tab_to_find):
+                    bundle_logger.debug(f"[HYP]......SUCCESS: Found tab '{tab_to_find}' on page {page_idx} in line: '{line_text}'")
+                    annotation = {
+                        'title': entry[1],  # title of the TOC entry
+                        'toc_page': page_idx,  # 0-based index for TOC page
+                        'coords': (line['x0'], line['bottom'], line['x1'], line['top']),
+                        'destination_page': int(entry[3]) + length_of_frontmatter
+                    }
+                    list_of_annotation_coords.append(annotation)
+                    found_match = True
+                    break
+            if found_match:
+                break
 
     # Step 3: Add annotations to the PDF
-    if list_of_annotation_coords:
-        add_annotations_with_transform(pdf_file, list_of_annotation_coords, output_file)
-        bundle_logger.debug(f"[HYP]Added {len(list_of_annotation_coords)} hyperlink annotations")
-    else:
-        bundle_logger.warning("[HYP]No hyperlink annotations could be created.")
+    add_annotations_with_transform(pdf_file, list_of_annotation_coords, output_file)
 
 
 class TocTexConfig(NamedTuple):
@@ -1985,16 +2000,12 @@ def bundle_last_leg(bundle_last_leg_params: BundleLastLegParams):
     dedent_and_log(bundle_logger, log_msg)
     try:
         add_hyperlinks(
-            AddHyperlinksParams(
                 merged_file_with_frontmatter,
                 hyperlinked_file,
                 length_of_coversheet if length_of_coversheet is not None else 0,
                 length_of_frontmatter,
-                toc_entries,
-                bundle_config.date_setting,
-                bundle_config.roman_for_preface,
+                toc_entries
             )
-        )
     except Exception as e:
         raise HyperlinkingError("A", "[CB]..Error during add_hyperlinks") from e
     if not Path(hyperlinked_file).exists():
