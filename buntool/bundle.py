@@ -38,15 +38,16 @@ import os
 # General
 import re
 import shutil
-import tempfile
 import textwrap
 import zipfile
-from dataclasses import dataclass
 from datetime import datetime
+from itertools import count
 from pathlib import Path
+from typing import NamedTuple
 
 import pdfplumber
 import reportlab.rl_config
+from colorlog import ColoredFormatter
 from pikepdf import OutlineItem, Pdf
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link
@@ -75,9 +76,10 @@ from reportlab.platypus import (
 from reportlab.rl_config import defaultPageSize
 from werkzeug.utils import secure_filename
 
+from buntool.bundle_config import BundleConfig, BundleConfigParams
+
 # custom
 from buntool.makedocxindex import DocxConfig, create_toc_docx
-from buntool.logger import ColorFormatter
 from buntool.textwrap_custom import dedent_and_log
 
 # Set globals
@@ -113,7 +115,12 @@ def configure_logger(bundle_config, session_id=None):
     bundle_logger.setLevel(logging.DEBUG)
     bundle_logger.propagate = False
     formatter = logging.Formatter("%(asctime)s-%(levelname)s-[BUN]: %(message)s")
-    color_formatter = ColorFormatter("%(asctime)s-%(levelname)s-[BUN]: %(message)s")
+    color_formatter = ColoredFormatter(
+        '%(log_color)s%(asctime)s - %(levelname)s - [BUN]: %(message)s',
+        log_colors={'DEBUG': 'cyan', 'INFO': 'green', 'WARNING': 'yellow', 'ERROR': 'red', 'CRITICAL': 'red,bg_white'},
+        reset=True
+    )
+
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(color_formatter)
     bundle_logger.addHandler(console_handler)
@@ -227,7 +234,7 @@ def parse_the_date(date, bundle_config):
         return date
     # check if date matches the expected format
     if not re.match(r"\d{4}-\d{2}-\d{2}", date):
-        bundle_logger.exception(f"[PTD] Error: Date does not match expected format: {date}")
+        bundle_logger.error(f"[PTD] Error: Date does not match expected format: {date}")
         return date
     try:
         parsed_date = datetime.strptime(date, "%Y-%m-%d")
@@ -314,8 +321,24 @@ def get_pdf_creation_date(file):
         return None
 
 
-def _generate_toc_entry(item, page_counts, tab_counts, section_counts, index_data, input_files):
+class TocEntryParams(NamedTuple):
+    item: tuple
+    page_counts: dict
+    tab_counts: count
+    section_counts: count
+    index_data: dict
+    input_files: list
+
+
+def _generate_toc_entry(toc_entry_params: TocEntryParams):
     """Generate a single TOC entry tuple for a given item from the index."""
+    item = toc_entry_params.item
+    page_counts = toc_entry_params.page_counts
+    tab_counts = toc_entry_params.tab_counts
+    section_counts = toc_entry_params.section_counts
+    index_data = toc_entry_params.index_data
+    input_files = toc_entry_params.input_files
+
     filename, (title, _, section) = item
 
     if section == "1":
@@ -324,7 +347,7 @@ def _generate_toc_entry(item, page_counts, tab_counts, section_counts, index_dat
 
     # It's a file entry
     tab_number = f"{next(tab_counts):03}."
-    current_page_start = page_counts['total']
+    current_page_start = page_counts["total"]
 
     # Find the full path for the file
     this_file_path = next((path for path in input_files if path.name == Path(filename).name), None)
@@ -336,7 +359,7 @@ def _generate_toc_entry(item, page_counts, tab_counts, section_counts, index_dat
     try:
         with Pdf.open(this_file_path) as src:
             num_pages = len(src.pages)
-            page_counts['total'] += num_pages
+            page_counts["total"] += num_pages
 
         entry_title, entry_date, _ = index_data.get(Path(filename).name, (Path(filename).stem, "Unknown", ""))
         if entry_date == "Unknown":
@@ -363,14 +386,16 @@ def merge_pdfs_create_toc_entries(input_files, output_file, index_data, bundle_c
         - page number
     """
     pdf = Pdf.new()
-    page_counts = {'total': 0}  # Use a mutable dict to track page count across list comprehension
-    tab_counts = iter(range(1, len(index_data) + 1))
-    section_counts = iter(range(1, len(index_data) + 1))
+    page_counts = {"total": 0}  # Use a mutable dict to track page count across list comprehension
+    tab_counts = count(1)
+    section_counts = count(1)
 
     # Generate TOC entries
     toc_entries = [
-        entry for item in index_data.items()
-        if (entry := _generate_toc_entry(item, page_counts, tab_counts, section_counts, index_data, input_files)) is not None
+        entry
+        for item in index_data.items()
+        if (entry := _generate_toc_entry(toc_entry_params=TocEntryParams(item, page_counts, tab_counts, section_counts, index_data, input_files)))
+        is not None
     ]
 
     # Now, merge the PDFs in the correct order
@@ -383,14 +408,14 @@ def merge_pdfs_create_toc_entries(input_files, output_file, index_data, bundle_c
             try:
                 with Pdf.open(this_file_path) as src:
                     pdf.pages.extend(src.pages)
-            except Exception as e:
-                bundle_logger.error(f"Error merging file {this_file_path}: {e}")
+            except Exception:
+                bundle_logger.exception(f"Error merging file {this_file_path}")
 
     pdf.save(output_file)
     return toc_entries
 
 
-def _create_bookmark_item(entry, length_of_frontmatter, bundle_config):
+def _create_bookmark_item(entry, length_of_frontmatter, bundle_config: BundleConfig):
     """Creates a single OutlineItem for a TOC entry based on bookmark settings."""
     tab_number, title, date, page = entry
     destination_page = page + length_of_frontmatter
@@ -405,14 +430,14 @@ def _create_bookmark_item(entry, length_of_frontmatter, bundle_config):
     elif setting == "tab-title-date-page":
         label = f"{tab_number} {title} ({date}) [pg.{1 + destination_page}]"
     else:
-        bundle_logger.exception(f"[ABTP]Error: Unknown bookmark_setting: {setting}")
+        bundle_logger.error(f"[ABTP]Error: Unknown bookmark_setting: {setting}")
         # Fallback to the default bookmark style
         label = f"{tab_number} {title}"
 
     return OutlineItem(label, destination_page)
 
 
-def add_bookmarks_to_pdf(pdf_file, output_file, toc_entries, length_of_frontmatter, bundle_config):
+def add_bookmarks_to_pdf(pdf_file, output_file, toc_entries, length_of_frontmatter, bundle_config: BundleConfig):
     """Add outline entries ('bookmarks') to a PDF for navigation..
 
     It reads the digested toc_entries and adds an outline item for each.
@@ -530,13 +555,9 @@ def _create_reportlab_row(row_tuple, date_col_hdr, dummy, page_offset, styleShee
 
 def _build_reportlab_table_data(toc_entries, date_col_hdr, dummy, page_offset, styleSheet):
     """Build the data structure for the ReportLab table."""
-    list_of_section_breaks = [
-        rowidx for rowidx, current_row_tuple in enumerate(toc_entries) if "SECTION_BREAK" in current_row_tuple[0]
-    ]
+    list_of_section_breaks = [rowidx for rowidx, current_row_tuple in enumerate(toc_entries) if "SECTION_BREAK" in current_row_tuple[0]]
 
-    reportlab_table_data = [
-        _create_reportlab_row(row, date_col_hdr, dummy, page_offset, styleSheet) for row in toc_entries
-    ]
+    reportlab_table_data = [_create_reportlab_row(row, date_col_hdr, dummy, page_offset, styleSheet) for row in toc_entries]
 
     return reportlab_table_data, list_of_section_breaks
 
@@ -613,7 +634,7 @@ def _setup_reportlab_styles(main_font, bold_font, base_font_size):
     return styleSheet
 
 
-def create_toc_pdf_reportlab(toc_entries, casedetails, bundle_config, output_file, options: dict):
+def create_toc_pdf_reportlab(toc_entries, casedetails: dict[str, str], bundle_config: BundleConfig, output_file, options: dict):
     """Generate a table of contents PDF using ReportLab."""
     styles = _get_toc_pdf_styles(options.get("date_setting"), bundle_config.index_font)
     main_font = styles["main_font"]
@@ -637,9 +658,13 @@ def create_toc_pdf_reportlab(toc_entries, casedetails, bundle_config, output_fil
         str(output_file), pagesize=A4, rightMargin=1.5 * cm, leftMargin=1.5 * cm, topMargin=1 * cm, bottomMargin=1.5 * cm
     )
 
+    reportlab_pdf = SimpleDocTemplate(
+        str(output_file), pagesize=A4, rightMargin=1.5 * cm, leftMargin=1.5 * cm, topMargin=1 * cm, bottomMargin=1.5 * cm
+    )
+
     # Claim No table - top right
     claimno_table_data = [
-        [Paragraph(casedetails[1], styleSheet["claimno_style"])],  # Claim No
+        [Paragraph(casedetails.get("claim_no", ""), styleSheet["claimno_style"])],  # Claim No
     ]
     claimno_table = Table(
         data=claimno_table_data,
@@ -662,13 +687,13 @@ def create_toc_pdf_reportlab(toc_entries, casedetails, bundle_config, output_fil
     # Now, the case name and bundle title:
     if not options.get("confidential"):
         header_table_data = [
-            ["", Paragraph(casedetails[2], styleSheet["case_name_style"]), ""],  # Case Name
-            ["", Paragraph(casedetails[0], styleSheet["bundle_title_style"]), ""],  # Bundle Title
+            ["", Paragraph(casedetails.get("case_name", ""), styleSheet["case_name_style"]), ""],  # Case Name
+            ["", Paragraph(casedetails.get("bundle_title", ""), styleSheet["bundle_title_style"]), ""],  # Bundle Title
         ]
     else:
         header_table_data = [
-            ["", Paragraph(casedetails[2], styleSheet["case_name_style"]), ""],  # Case Name
-            ["", Paragraph((f'<font color="red">CONFIDENTIAL</font> {casedetails[0]}'), styleSheet["bundle_title_style"]), ""],
+            ["", Paragraph(casedetails.get("case_name", ""), styleSheet["case_name_style"]), ""],  # Case Name
+            ["", Paragraph((f'<font color="red">CONFIDENTIAL</font> {casedetails.get("bundle_title", "")}'), styleSheet["bundle_title_style"]), ""],
             # Bundle Title
         ]
     header_table = Table(header_table_data, colWidths=[PAGE_WIDTH / 8, PAGE_WIDTH * (6 / 8), PAGE_WIDTH / 8])  # aesthetic choice
@@ -690,8 +715,9 @@ def create_toc_pdf_reportlab(toc_entries, casedetails, bundle_config, output_fil
     # Third, the main toc entries able:
     reportlab_table_data = []
 
-    reportlab_table_data, list_of_section_breaks = _build_reportlab_table_data(toc_entries, date_col_hdr, options.get("dummy"), page_offset, \
-                                                                               styleSheet)
+    reportlab_table_data, list_of_section_breaks = _build_reportlab_table_data(
+        toc_entries, date_col_hdr, options.get("dummy"), page_offset, styleSheet
+    )
     toc_table = Table(
         reportlab_table_data,
         colWidths=[1.3 * cm, title_col_width * cm, date_col_width * cm, page_col_width * cm],
@@ -777,7 +803,7 @@ def generate_footer_pages_reportlab(filename, num_pages, bundle_config):
     doc.build(story, onFirstPage=footer_config_with_bundle, onLaterPages=footer_config_with_bundle)
 
 
-def reportlab_footer_config(canvas, doc, bundle_config):
+def reportlab_footer_config(canvas, doc, bundle_config: BundleConfig):
     """Configure the footer for ReportLab documents.
 
     the other reportlab functions during their build process.
@@ -954,44 +980,6 @@ def get_footer_text(footer_prefix, page_num_style, main_page_count, frontmatter_
         return page_part
 
 
-class TocTexConfig:
-    """Configuration for TeX-based TOC generation."""
-
-    def __init__(self, bundle_config, confidential, date_setting, dummy, frontmatter_offset, length_of_coversheet, main_page_count, roman_numbering):
-        self.bundle_config = bundle_config
-        self.confidential = confidential
-        self.date_setting = date_setting
-        self.dummy = dummy
-        self.frontmatter_offset = frontmatter_offset
-        self.length_of_coversheet = length_of_coversheet
-        self.main_page_count = main_page_count
-        self.roman_numbering = roman_numbering
-
-
-def _create_tex_footer_string(config: TocTexConfig):
-    """Generate the footer string for the TeX TOC."""
-    # pylint: disable=R0912,R0915
-    bundle_logger.debug("[CTP]Creating TOC PDF. Parsing settings:")
-
-    index_font_family = None
-    footer_font = None
-    starting_page = 1
-    footer_alignment_setting = None
-    footer_text = None
-    if not config.roman_numbering:
-        # parse index font setting
-        # set starting page to be one more than the length_of_coversheet
-        starting_page = config.length_of_coversheet + 1
-        index_font_family = get_index_font_family(config.bundle_config.index_font)
-        footer_alignment_setting = get_footer_alignment_setting(config.bundle_config.page_num_align)
-        footer_font = get_footer_font(config.bundle_config.footer_font)
-        footer_text = get_footer_text(
-            config.bundle_config.footer_prefix, config.bundle_config.page_num_style, config.main_page_count, config.frontmatter_offset
-        )
-
-    return footer_alignment_setting, footer_font, footer_text, index_font_family, starting_page
-
-
 toc_content_prefix = r"""
 \documentclass[12pt,a4paper]{article}
 \usepackage{fancyhdr}
@@ -1046,146 +1034,15 @@ bn2 = r"""
 """
 
 
-def create_toc_pdf_tex(toc_entries, casedetails, output_file, config: TocTexConfig):
-    """Generate a table of contents PDF using TeX."""
-    bundle_name = sanitise_latex(casedetails[0])
-    page_offset = 0 if config.dummy else config.frontmatter_offset + 1
-    date_col_hdr, date_col_width = ("Date", "3.5cm") if config.date_setting != "hide_date" else ("", "0.3cm")
-    claimno_hdr = sanitise_latex(casedetails[1]) if casedetails[1] else ""
-    casename = sanitise_latex(casedetails[2]) if casedetails[2] else ""
-    footer_alignment_setting, footer_font, footer_text, index_font_family, starting_page = _create_tex_footer_string(config)
-
-    # Define the helper function for non-roman numbering
-    def get_non_roman_pagestyle():
-        return f"""
-        \\newcommand{{\\fontsetting}}{{\\fontfamily{{{footer_font}}}\\fontseries{{b}}\\base_font_size{{18}}{{22}}\\selectfont}}
-        \\setcounter{{page}}{{{starting_page}}}
-        \\begin{{document}}
-        \\pagestyle{{fancy}}
-        \\renewcommand{{\\headrulewidth}}{{0pt}}
-        \\setlength{{\\footskip}}{{20pt}}
-        \\fancyhf{{}} % to clear the header and the footer simultaneously
-        \\fancyfoot[{footer_alignment_setting}]{{\\fontsetting {footer_text}}}
-        """
-
-    # Define the bundle name header
-    bundle_header = (
-        f'\\textbf{{\\large{{\\textcolor{{red}}{{"CONFIDENTIAL"}}\\\\ {bundle_name.upper()}}}}} \\\\'
-        if config.confidential
-        else f"\\textbf{{\\Large{{{bundle_name.upper()}}}}} \\\\"
-    )
-
-    # Build all the parts of the LaTeX document
-    parts = [
-        r"""
-\documentclass[12pt,a4paper]{article}
-\usepackage{fancyhdr}
-\usepackage{geometry}
-\usepackage{hyperref}
-\usepackage{longtable}
-\usepackage{color, colortbl}
-""",
-        r"\usepackage{xcolor}" if config.confidential else "",
-        r"""
-\geometry{a4paper, hmargin=2.5cm,vmargin=2cm}
-\definecolor{Gray}{gray}{0.9}
-""",
-        get_non_roman_pagestyle()
-        if not config.roman_numbering
-        else r"""
-\begin{document}
-\pagestyle{empty}
-""",
-        rf"\fontfamily{{{index_font_family}}}\selectfont" if index_font_family else "",
-        rf"\hfill\textbf{{\normalsize{{{claimno_hdr}}}}} \\" if claimno_hdr else "",
-        r"\vspace{{-0.5cm}}" if claimno_hdr else "",
-        rf"""
-\begin{{center}}
-\textbf{{\large{{{casename}}}}} \\
-\end{{center}}
-"""
-        if casename
-        else "",
-        rf"""
-\begin{{center}}
-\rule{{0.5\linewidth}}{{0.3mm}} \\
-\vspace{{0.3cm}}
-{bundle_header}
-\rule{{0.5\linewidth}}{{0.3mm}} \\
-\vspace{{-0.5cm}}
-\end{{center}}
-"""
-        if bundle_name
-        else "",
-        rf"""
-\def\arraystretch{{1.3}}
-\begin{{longtable}}{{p{{1.2cm}} p{{10cm}} p{{{date_col_width}}} r}}
-\hline
-\textbf{{Tab}} & \textbf{{Title}} & \textbf{{{date_col_hdr}}} & \textbf{{Page}} \\
-\hline
-\endfirsthead
-\hline
-\textbf{{Tab}} & \textbf{{Title}} & \textbf{{{date_col_hdr}}} & \textbf{{Page}} \\
-\hline
-\endhead
-\hline
-\endfoot
-\hline
-\endlastfoot
-""",
-        "".join(
-            [
-                r"\hline \rowcolor{Gray}\multicolumn{4}{l}{\textbf{" + entry[1] + r"}} \\ \hline "
-                if "SECTION_BREAK" in entry[0]
-                else f"{sanitise_latex(entry[0])} & {sanitise_latex(entry[1])} & {('' if config.date_setting == 'hide_date' else sanitise_latex(entry[2]))} & {(999 if config.dummy else entry[3] + page_offset)} \\\\"
-                for entry in toc_entries
-            ]
-        ),
-        r"""
-\end{longtable}
-\newpage
-\pagenumbering{arabic}
-\end{document}
-""",
-    ]
-
-    # Join all parts, filtering out empty strings
-    toc_content = "".join(part for part in parts if part)
-
-    # Determine output paths
-    if config.dummy:
-        toc_tex_path = Path(output_file).parent / "dummytoc.tex"
-        jobname = "dummytoc"
-    else:
-        jobname = "toc"
-        toc_tex_path = Path(output_file).parent / "toc.tex"
-
-    # Write the LaTeX content to file
-    with Path(toc_tex_path).open("w") as f:
-        f.write(toc_content)
-
-    # Compile the LaTeX document
-    if Path(toc_tex_path).exists():
-        bundle_logger.debug(f"[CTP]TOC content written to file: {toc_tex_path}")
-        result = os.system(f"pdflatex -output-directory {Path(output_file).parent} -jobname={jobname} {toc_tex_path} > /dev/null")
-        if result != 0:
-            bundle_logger.exception(f"[CTP]..pdflatex command failed with error code {result}")
-        else:
-            bundle_logger.debug("[CTP]..pdflatex command succeeded.")
-    else:
-        bundle_logger.exception(f"[CTP]Error writing TOC content to file: {toc_tex_path}")
-
-
-class FooterTexConfig:
+class FooterTexConfig(NamedTuple):
     """Configuration for TeX-based footer generation."""
 
-    def __init__(self, main_page_count, length_of_frontmatter_offset, page_num_alignment, page_num_font, page_numbering_style, footer_prefix):
-        self.main_page_count = main_page_count
-        self.length_of_frontmatter_offset = length_of_frontmatter_offset
-        self.page_num_alignment = page_num_alignment
-        self.page_num_font = page_num_font
-        self.page_numbering_style = page_numbering_style
-        self.footer_prefix = footer_prefix
+    length_of_frontmatter_offset: int
+    main_page_count: int
+    page_num_alignment: str
+    page_num_font: str
+    page_numbering_style: str
+    footer_prefix: str
 
 
 def _get_tex_font_settings(bundle_config_index_font):
@@ -1266,7 +1123,7 @@ def generate_footer_pages_tex(  # noqa: PLR0915
     # Compile LaTeX file to PDF
     result = os.system(f"pdflatex -output-directory {Path(page_numbers_pdf_path).parent} {page_numbers_tex_path} > /dev/null")
     if result != 0:
-        bundle_logger.exception(f"[MPNP]pdflatex command failed with error code {result}")
+        bundle_logger.error(f"[MPNP]pdflatex command failed with error code {result}")
     else:
         bundle_logger.debug(f"[MPNP]pdflatex command succeeded. Page numbers PDF saved to {page_numbers_pdf_path}")
     return page_numbers_pdf_path
@@ -1292,7 +1149,7 @@ def add_footer_to_bundle(input_file, page_numbers_pdf_path, output_file):
     # Ensure the number of pages match
     if len(input_pdf.pages) != len(page_numbers_pdf.pages):
         msg = f"Page counts do not match: input={len(input_pdf.pages)} vs page numbers={len(page_numbers_pdf.pages)}"
-        bundle_logger.exception("[OPN]Error overlaying page numbers")
+        bundle_logger.error("[OPN]Error overlaying page numbers")
         raise ValueError(msg)
 
     try:
@@ -1315,7 +1172,7 @@ def add_footer_to_bundle(input_file, page_numbers_pdf_path, output_file):
         raise
 
 
-def pdf_paginator_reportlab(input_file, bundle_config, output_file):
+def pdf_paginator_reportlab(input_file, bundle_config: BundleConfig, output_file):
     """Drop-in replacement for tex alternative.
 
     Calls sub-functions to create page numbers and add them to the bundle.
@@ -1338,11 +1195,11 @@ def pdf_paginator_reportlab(input_file, bundle_config, output_file):
             bundle_logger.exception("[PPRL]Error overlaying page numbers")
             raise
     else:
-        bundle_logger.exception("[PPRL]Error creating page numbers PDF!")
+        bundle_logger.error("[PPRL]Error creating page numbers PDF!")
     return main_page_count
 
 
-def pdf_paginator_tex(input_file, output_file, bundle_config, frontmatter_offset):
+def pdf_paginator_tex(input_file, output_file, bundle_config: BundleConfig, frontmatter_offset):
     """Manage pagination using TeX.
 
     This is the pagination manager for generate_footer_pages_tex and add_footer_to_bundle.
@@ -1376,7 +1233,7 @@ def pdf_paginator_tex(input_file, output_file, bundle_config, frontmatter_offset
             bundle_logger.exception("[PPError overlaying page numbers")
             raise
     else:
-        bundle_logger.exception("[PPError creating page numbers PDF: see pdftex temporary logs in temp folder.")
+        bundle_logger.error("[PPError creating page numbers PDF: see pdftex temporary logs in temp folder.")
     return main_page_count
 
 
@@ -1476,10 +1333,25 @@ def add_annotations_with_transform(pdf_file, list_of_annotation_coords, output_f
         writer.write(output)
 
 
+class FindHyperlinkMatchForEntryParams(NamedTuple):
+    entry: tuple[str, str, str, str]
+    scraped_pages_text: list[list[dict[str, float | str]]]
+    length_of_coversheet: int
+    length_of_frontmatter: int
+    date_setting: str
+    roman_page_labels: bool
+
+
 def _find_hyperlink_match_for_entry(
-    entry, scraped_pages_text, length_of_coversheet, length_of_frontmatter, date_setting, roman_page_labels
-):
+    find_hyperlink_match_for_entry_params: FindHyperlinkMatchForEntryParams,
+) -> dict[str, int | str | tuple[float, float, float, float]] | None:
     """Find the coordinates and page for a single TOC entry to create a hyperlink."""
+    entry = find_hyperlink_match_for_entry_params.entry
+    scraped_pages_text = find_hyperlink_match_for_entry_params.scraped_pages_text
+    length_of_coversheet = find_hyperlink_match_for_entry_params.length_of_coversheet
+    length_of_frontmatter = find_hyperlink_match_for_entry_params.length_of_frontmatter
+    date_setting = find_hyperlink_match_for_entry_params.date_setting
+    roman_page_labels = find_hyperlink_match_for_entry_params.roman_page_labels
 
     def _create_search_patterns(entry_data):
         """Create regex patterns to find the TOC entry in the extracted text."""
@@ -1497,9 +1369,7 @@ def _find_hyperlink_match_for_entry(
             main_pattern = re.compile(main_pattern_str)
         else:
             date_key = re.escape(entry_data[2].replace(" ", ""))
-            main_pattern_str = (
-                f"{tab_key}{title_key}.*?{date_key}{page_key}" if is_long_title else f"{tab_key}{title_key}{date_key}{page_key}"
-            )
+            main_pattern_str = f"{tab_key}{title_key}.*?{date_key}{page_key}" if is_long_title else f"{tab_key}{title_key}{date_key}{page_key}"
             main_pattern = re.compile(main_pattern_str)
 
         return [main_pattern, fallback_pattern]
@@ -1510,28 +1380,35 @@ def _find_hyperlink_match_for_entry(
     # Search through the scraped text for a match
     for page_idx, page_lines in enumerate(scraped_pages_text, start=length_of_coversheet):
         for line in page_lines:
-            stripped_line_text = line["text"].replace(" ", "")
+            stripped_line_text = str(line["text"]).replace(" ", "")
             for pattern in patterns:
                 if pattern.search(stripped_line_text):
                     bundle_logger.debug(f"[HYP]....found on page {page_idx} with pattern '{pattern.pattern}'")
                     return {
                         "title": entry[1],
-                        "toc_page": page_idx,
-                        "coords": (line["x0"], line["bottom"], line["x1"], line["top"]),
+                        "toc_page": int(page_idx),
+                        "coords": (
+                            float(line["x0"]),
+                            float(line["bottom"]),
+                            float(line["x1"]),
+                            float(line["top"]),
+                        ),
                         "destination_page": int(entry[3]) + length_of_frontmatter,
                     }
     return None
 
 
-def add_hyperlinks(
-        pdf_file,
-        output_file,
-        length_of_coversheet,
-        length_of_frontmatter,
-        toc_entries,
-        date_setting="show_date",
-        roman_page_labels=False
-):
+class AddHyperlinksParams(NamedTuple):
+    pdf_file: Path
+    output_file: Path
+    length_of_coversheet: int
+    length_of_frontmatter: int
+    toc_entries: list[tuple[str, str, str, str]]
+    date_setting: str = "show_date"
+    roman_page_labels: bool = False
+
+
+def add_hyperlinks(add_hyperlinks_params: AddHyperlinksParams):
     """Add hyperlinks to the table of contents pages.
 
     The PDF standard defines these as rectangular areas with an action to jump to a destination within the document.
@@ -1546,21 +1423,33 @@ def add_hyperlinks(
     - find that search string in the extracted text; thus, find the coordinates on the page.
     - pass off to the annotation writer for actual writing.
     """
+    pdf_file = add_hyperlinks_params.pdf_file
+    output_file = add_hyperlinks_params.output_file
+    length_of_coversheet = add_hyperlinks_params.length_of_coversheet
+    length_of_frontmatter = add_hyperlinks_params.length_of_frontmatter
+    toc_entries = add_hyperlinks_params.toc_entries
+    date_setting = add_hyperlinks_params.date_setting
+    roman_page_labels = add_hyperlinks_params.roman_page_labels
+
     bundle_logger.debug("[HYP]Starting hyperlink addition")
 
     # Step 1: Extract text and coordinates from TOC
     with pdfplumber.open(pdf_file) as pdf:
-        scraped_pages_text = [
-            pdf.pages[idx].extract_text_lines() for idx in range(length_of_coversheet, length_of_frontmatter)
-        ]
+        scraped_pages_text = [pdf.pages[idx].extract_text_lines() for idx in range(length_of_coversheet, length_of_frontmatter)]
 
     # Step 2: Build a list of annotations using a list comprehension
     list_of_annotation_coords = [
         match
         for entry in toc_entries
-        if "SECTION_BREAK" not in entry[0] and entry[3] != "Page"
-        and (match := _find_hyperlink_match_for_entry(entry, scraped_pages_text, length_of_coversheet, length_of_frontmatter, date_setting, \
-                                                      roman_page_labels))
+        if "SECTION_BREAK" not in entry[0]
+        and entry[3] != "Page"
+        and (
+            match := _find_hyperlink_match_for_entry(
+                FindHyperlinkMatchForEntryParams(
+                    entry, scraped_pages_text, length_of_coversheet, length_of_frontmatter, date_setting, roman_page_labels
+                )
+            )
+        )
     ]
 
     # Step 3: Add annotations to the PDF
@@ -1571,61 +1460,50 @@ def add_hyperlinks(
         bundle_logger.warning("[HYP]No hyperlink annotations could be created.")
 
 
-@dataclass(init=False)  # type: ignore
-class BundleConfig:
-    def __init__(
-        self,
-        timestamp,
-        case_details,
-        csv_string,
-        confidential_bool,
-        zip_bool,
-        session_id,
-        user_agent,
-        page_num_align,
-        index_font,
-        footer_font,
-        page_num_style,
-        footer_prefix,
-        date_setting,
-        roman_for_preface,
-        expected_length_of_frontmatter=0,
-        main_page_count=0,
-        temp_dir=None,
-        logs_dir=None,
-        bookmark_setting="uk_abbreviated",
-    ):
-        self.timestamp = timestamp or datetime.now().strftime("%Y-%m-%d-%H%M%S")
-        self.case_details = case_details
-        self.csv_string = csv_string if csv_string else None
-        self.confidential_bool = confidential_bool if confidential_bool else False
-        self.zip_bool = zip_bool if zip_bool else True
-        self.session_id = session_id if session_id else timestamp
-        self.user_agent = user_agent or "Unknown"
-        self.page_num_align = page_num_align if page_num_align else "centre"
-        self.index_font = index_font if index_font else "Default"
-        self.footer_font = footer_font if footer_font else "Default"
-        self.page_num_style = page_num_style if page_num_style else "page_x_of_y"
-        self.footer_prefix = footer_prefix if footer_prefix else ""
-        self.date_setting = date_setting if date_setting else "DD_MM_YYYY"
-        self.roman_for_preface = roman_for_preface if roman_for_preface else False
-        self.expected_length_of_frontmatter = expected_length_of_frontmatter if expected_length_of_frontmatter else 0
-        self.main_page_count = main_page_count if main_page_count else 0
-        self.total_number_of_pages = self.main_page_count + self.expected_length_of_frontmatter
-        base_temp = tempfile.gettempdir()
-        self.temp_dir = temp_dir if temp_dir else Path(base_temp) / "buntool" / "tempfiles" / self.session_id
-        self.logs_dir = logs_dir if logs_dir else Path(base_temp) / "buntool" / "logs" / self.session_id
-        self.bookmark_setting = bookmark_setting if bookmark_setting else "uk_abbreviated"
+class TocTexConfig(NamedTuple):
+    bundle_config: BundleConfig
+    roman_numbering: bool
+    length_of_coversheet: int
+    frontmatter_offset: int
+    main_page_count: int
+    date_setting: str
+    confidential: bool
+    dummy: bool
 
 
-def _initialize_bundle_creation(bundle_config_data, output_file, coversheet, input_files, index_file):
+def _create_tex_footer_string(config: TocTexConfig):
+    """Generate the footer string for the TeX TOC."""
+    # pylint: disable=R0912,R0915
+    bundle_logger.debug("[CTP]Creating TOC PDF. Parsing settings:")
+
+    index_font_family = None
+    footer_font = None
+    starting_page = 1
+    footer_alignment_setting = None
+    footer_text = None
+    if not config.roman_numbering:
+        # parse index font setting
+        # set starting page to be one more than the length_of_coversheet
+        starting_page = config.length_of_coversheet + 1
+        index_font_family = get_index_font_family(config.bundle_config.index_font)
+        footer_alignment_setting = get_footer_alignment_setting(config.bundle_config.page_num_align)
+        footer_font = get_footer_font(config.bundle_config.footer_font)
+        footer_text = get_footer_text(
+            config.bundle_config.footer_prefix, config.bundle_config.page_num_style, config.main_page_count, config.frontmatter_offset
+        )
+
+    return footer_alignment_setting, footer_font, footer_text, index_font_family, starting_page
+
+
+def _initialize_bundle_creation(bundle_config_data: BundleConfig, output_file, coversheet, input_files, index_file):
     """Initialize variables and logging for bundle creation. Returns a list of initial temp files."""
     BUNTOOL_VERSION = "2025.01.24"
 
     # various initial file and data handling:
     bundle_config = bundle_config_data
     temp_dir = bundle_config.temp_dir
-    Path(temp_dir).mkdir(parents=True, exist_ok=True)
+    temp_path = Path(temp_dir)
+    temp_path.mkdir(parents=True, exist_ok=True)
     tmp_output_file = temp_dir / output_file
     coversheet_path = temp_dir / coversheet if coversheet else None
 
@@ -1647,18 +1525,16 @@ def _initialize_bundle_creation(bundle_config_data, output_file, coversheet, inp
             ....bundle_config: {bundle_config.__dict__}"""
     dedent_and_log(bundle_logger, debug_log_msg)
 
-    initial_temp_files = [
-        f for f in (coversheet_path, index_file) if f
-    ]
+    initial_temp_files = [f for f in (coversheet_path, index_file) if f]
     initial_temp_files.extend(input_files)
 
-    return bundle_config, temp_dir, tmp_output_file, coversheet_path, initial_temp_files
+    return bundle_config, temp_path, tmp_output_file, coversheet_path, initial_temp_files
 
 
-def _process_index_and_merge(bundle_config, index_file, temp_dir, input_files):
+def _process_index_and_merge(bundle_config: BundleConfig, index_file, temp_path: Path, input_files):
     """Process index data and merge input PDFs. Returns index data, toc entries, and a list of temp files."""
     if not index_file and bundle_config.csv_string:
-        index_file_path = Path(temp_dir) / "index.csv"
+        index_file_path = temp_path / "index.csv"
         with Path(index_file_path).open("w") as f:
             f.write(bundle_config.csv_string)
         index_file = index_file_path
@@ -1672,7 +1548,7 @@ def _process_index_and_merge(bundle_config, index_file, temp_dir, input_files):
         bundle_logger.info("[CB]No index data provided.")
 
     # Merge PDFs using provided unique filenames
-    merged_file = Path(temp_dir) / "TEMP01_mainpages.pdf"
+    merged_file = temp_path / "TEMP01_mainpages.pdf"
     log_msg = f"""
         [CB]Calling merge_pdfs_create_toc_entries [MP] with arguments:
         ....input_files: {input_files}
@@ -1694,35 +1570,35 @@ def _process_index_and_merge(bundle_config, index_file, temp_dir, input_files):
     # list out settings in a human-readable way for remote user support.
     file_details = "\n".join(
         f'            ..File {idx + 1}: Filename "{file}"\n'
-        f'            .... had index data: {file.name in index_data}\n'
-        f'            .... had {len(Pdf.open(file).pages)} page(s).'
+        f"            .... had index data: {file.name in index_data}\n"
+        f"            .... had {len(Pdf.open(file).pages)} page(s)."
         for idx, file in enumerate(input_files)
     )
 
     user_settings_log = f"""\
-=============================================================================
-BUNTOOL -- BEGIN RECORD OF USER SETTINGS
-Time of use: {bundle_config.timestamp}
-STEP ONE:
-..Bundle Title: {bundle_config.case_details[1]}
-..Case Name: {bundle_config.case_details[0]}
-..Claim Number: {bundle_config.case_details[2]}
-STEP TWO:
-{file_details}
-STEP THREE:
-..Index Options:
-....Index font: {bundle_config.index_font}
-....Coversheet: {"Yes" if bundle_config.case_details[0] else "No coversheet provided."}
-....Date column: {bundle_config.date_setting}
-....Confidentiality: {bundle_config.confidential_bool}
-..Page Numbering Options:
-....Footer font: {bundle_config.footer_font}
-....Preface numbering: {bundle_config.roman_for_preface}
-....Page number alignment: {bundle_config.page_num_align}
-....Page numbering style: {bundle_config.page_num_style}
-....Footer prefix: {bundle_config.footer_prefix if bundle_config.footer_prefix else "No footer prefix"}
-END RECORD OF USER SETTINGS
-================================================================================="""
+        =============================================================================
+        BUNTOOL -- BEGIN RECORD OF USER SETTINGS
+        Time of use: {bundle_config.timestamp}
+        STEP ONE:
+        ..Bundle Title: {bundle_config.case_details.get('bundle_title', '')}
+        ..Case Name: {bundle_config.case_details.get('case_name', '')}
+        ..Claim Number: {bundle_config.case_details.get('claim_no', '')}
+        STEP TWO:
+        {file_details}
+        STEP THREE:
+        ..Index Options:
+        ....Index font: {bundle_config.index_font}
+        ....Coversheet: {"Yes" if bundle_config.case_details.get("case_name", '') else "No coversheet provided."}
+        ....Date column: {bundle_config.date_setting}
+        ....Confidentiality: {bundle_config.confidential_bool}
+        ..Page Numbering Options:
+        ....Footer font: {bundle_config.footer_font}
+        ....Preface numbering: {bundle_config.roman_for_preface}
+        ....Page number alignment: {bundle_config.page_num_align}
+        ....Page numbering style: {bundle_config.page_num_style}
+        ....Footer prefix: {bundle_config.footer_prefix if bundle_config.footer_prefix else "No footer prefix"}
+        END RECORD OF USER SETTINGS
+        ================================================================================="""
     dedent_and_log(bundle_logger, user_settings_log)
 
     with Pdf.open(merged_file) as mergedfile:
@@ -1731,7 +1607,7 @@ END RECORD OF USER SETTINGS
     return index_data, toc_entries, [merged_file], main_page_count
 
 
-def _create_front_matter(bundle_config, coversheet, coversheet_path, temp_dir, toc_entries):
+def _create_front_matter(bundle_config, coversheet, coversheet_path, temp_path: Path, toc_entries):
     """Create and merge front matter (coversheet and TOC). Returns any temporary files created."""
     if coversheet and coversheet_path and Path(coversheet_path).exists():
         with Pdf.open(coversheet_path) as coversheet_pdf:
@@ -1748,7 +1624,7 @@ def _create_front_matter(bundle_config, coversheet, coversheet_path, temp_dir, t
     if not bundle_config.roman_for_preface:
         bundle_logger.debug("[CB]Creating dummy TOC PDF to find length of frontmatter")
         try:
-            dummy_toc_pdf_path = Path(temp_dir) / "TEMP02_dummy_toc.pdf"
+            dummy_toc_pdf_path = temp_path / "TEMP02_dummy_toc.pdf"
             options = {"confidential": bundle_config.confidential_bool, "date_setting": bundle_config.date_setting, "dummy": True}
             create_toc_pdf_reportlab(  # DUMMY TOC)
                 toc_entries, bundle_config.case_details, bundle_config, dummy_toc_pdf_path, options
@@ -1757,16 +1633,18 @@ def _create_front_matter(bundle_config, coversheet, coversheet_path, temp_dir, t
             bundle_logger.exception("[CB]Error during first pass TOC creation")
             raise
         if not Path(dummy_toc_pdf_path).exists():
-            bundle_logger.exception(f"[CB]First pass TOC file unsuccessful: cannot locate expected ouput {dummy_toc_pdf_path}.")
+            bundle_logger.error(f"[CB]First pass TOC file unsuccessful: cannot locate expected ouput {dummy_toc_pdf_path}.")
             return None, None, None, []
         bundle_logger.info(f"[CB]dummy TOC PDF created at {dummy_toc_pdf_path}")
-        tempdir_path = Path(temp_dir)
-        temp_files.extend([
-            dummy_toc_pdf_path,
-            tempdir_path / "dummytoc.out",
-            tempdir_path / "TEMP02_dummy_toc.aux",
-            tempdir_path / "dummytoc.tex",
-        ])
+        tempdir_path = temp_path
+        temp_files.extend(
+            [
+                dummy_toc_pdf_path,
+                tempdir_path / "dummytoc.out",
+                tempdir_path / "TEMP02_dummy_toc.aux",
+                tempdir_path / "dummytoc.tex",
+            ]
+        )
         # find length of dummy TOC:
         with Pdf.open(dummy_toc_pdf_path) as dummytocpdf:
             length_of_dummy_toc = len(dummytocpdf.pages)
@@ -1781,138 +1659,252 @@ def _create_front_matter(bundle_config, coversheet, coversheet_path, temp_dir, t
     return expected_length_of_frontmatter, length_of_coversheet, length_of_dummy_toc, temp_files
 
 
-def _assemble_final_bundle(
-    bundle_config,
-    temp_dir,
-    merged_file,
-    expected_length_of_frontmatter,
-    toc_entries,
-    length_of_coversheet,
-    length_of_dummy_toc,
-    coversheet,
-    coversheet_path,
-    tmp_output_file,
-):
-    """Assembles the final PDF bundle by paginating, creating TOC, and adding bookmarks. Returns a list of created temp files."""
-    # Define all potential temporary file paths upfront
-    merged_paginated_no_toc = Path(temp_dir) / "TEMP03_paginated_mainpages.pdf"
-    page_numbers_pdf = Path(temp_dir) / "pageNumbers.pdf"
-    page_numbers_aux = Path(temp_dir) / "pageNumbers.aux"
-    page_numbers_tex = Path(temp_dir) / "pageNumbers.tex"
-    toc_file_path = Path(temp_dir) / "index.pdf"
-    toc_out = Path(temp_dir) / "index.out"
-    toc_log = Path(temp_dir) / "index.log"
-    toc_aux = Path(temp_dir) / "index.aux"
-    toc_tex = Path(temp_dir) / "toc.tex"
-    merged_file_with_frontmatter = Path(temp_dir) / "TEMP04_all_pages.pdf"
-    hyperlinked_file = Path(temp_dir) / "TEMP05-hyperlinked.pdf"
-    main_bookmarked_file = Path(temp_dir) / "TEMP06_main_bookmarks.pdf"
-    index_bookmarked_file = Path(temp_dir) / "TEMP07_all_bookmarks.pdf"
+class TocParams(NamedTuple):
+    bundle_config: BundleConfig
+    temp_path: Path
+    toc_entries: list
+    length_of_coversheet: int | None
+    expected_length_of_frontmatter: int
+    toc_file_path: Path
 
-    # Next step: paginate the merged main files of the PDF (the main content)
+
+class CreateTocError(Exception):
+    def __init__(self, message="TOC PDF creation failed."):
+        super().__init__(message)
+
+def _create_toc(toc_params: TocParams):
+    (
+        bundle_config,
+        temp_path,
+        toc_entries,
+        length_of_coversheet,
+        expected_length_of_frontmatter,
+        toc_file_path
+    ) = toc_params
+
+    bundle_config.expected_length_of_frontmatter = length_of_coversheet if length_of_coversheet is not None else 0  # janky reset for TOC
+
+    # Now, create TOC PDF For real:
     log_msg = f"""
-        [CB]Calling pdf_paginator_reportlab [PPRL] with arguments:
-        ....merged_file: {merged_file}
-        ....merged_paginated_no_toc: {merged_paginated_no_toc}
-        ....page_num_alignment: {bundle_config.page_num_align}
-        ....page_num_font: {bundle_config.footer_font}
-        ....page_numbering_style: {bundle_config.page_num_style}
-        ....footer_prefix: {bundle_config.footer_prefix}"""
+        [CB]Calling create_toc_pdf_reportlab [CT] - final version -  with arguments:
+        ....toc_entries: {toc_entries}
+        ....casedetails: {bundle_config.case_details}
+        ....toc_file_path: {toc_file_path}
+        ....confidential: {bundle_config.confidential_bool}
+        ....date_setting: {bundle_config.date_setting}
+        ....index_font: {bundle_config.index_font}
+        ....dummy: False
+        ....length_of_frontmatter: {expected_length_of_frontmatter}"""
     dedent_and_log(bundle_logger, log_msg)
+    options = {
+        "confidential": bundle_config.confidential_bool,
+        "date_setting": bundle_config.date_setting,
+        "dummy": False,
+        "roman_numbering": bundle_config.roman_for_preface,
+    }
+    create_toc_pdf_reportlab(toc_entries, bundle_config.case_details, bundle_config=bundle_config, output_file=toc_file_path, options=options)
+    if not Path(toc_file_path).exists():
+        raise CreateTocError()
+
+    docx_output_path = None
     try:
-        paginated_page_count = pdf_paginator_reportlab(merged_file, bundle_config, merged_paginated_no_toc)
-    except Exception:
-        bundle_logger.exception("[CB]..Error during pdf_paginator_reportlab")
-        paginated_page_count = 0
-    if not Path(merged_paginated_no_toc).exists():
-        bundle_logger.exception(f"[CB]..Paginating file unsuccessful: cannot locate expected ouput {merged_paginated_no_toc}.")
-        return None
-
-    assert paginated_page_count == bundle_config.main_page_count
-
-    def create_toc():
-        bundle_config.expected_length_of_frontmatter = length_of_coversheet  # janky reset for TOC
-
-        # Now, create TOC PDF For real:
-        log_msg = f"""
-            [CB]Calling create_toc_pdf_reportlab [CT] - final version -  with arguments:
-            ....toc_entries: {toc_entries}
-            ....casedetails: {bundle_config.case_details}
-            ....toc_file_path: {toc_file_path}
-            ....confidential: {bundle_config.confidential_bool}
-            ....date_setting: {bundle_config.date_setting}
-            ....index_font: {bundle_config.index_font}
-            ....dummy: False
-            ....length_of_frontmatter: {expected_length_of_frontmatter}"""
-        dedent_and_log(bundle_logger, log_msg)
-        options = {
-            "confidential": bundle_config.confidential_bool,
-            "date_setting": bundle_config.date_setting,
-            "dummy": False,
-            "roman_numbering": bundle_config.roman_for_preface,
-        }
-        create_toc_pdf_reportlab(toc_entries, bundle_config.case_details, bundle_config=bundle_config, output_file=toc_file_path, options=options)
-        if not Path(toc_file_path).exists():
-            bundle_logger.exception(f"[CB]..Creating TOC file unsuccessful: cannot locate expected output {toc_file_path}.")
-            return 1, None
-
-
-        docx_output_path = None
-        try:
-            docx_output_path = Path(temp_dir) / "docx_output.docx"
-            docx_config = DocxConfig(
-                confidential=bundle_config.confidential_bool, date_setting=bundle_config.date_setting, index_font_setting=bundle_config.index_font
-            )
-            create_toc_docx(toc_entries, bundle_config.case_details, docx_output_path, docx_config)
-        except Exception:
-            bundle_logger.exception("[CB]..Error during create_toc_docx")
-        return 0, docx_output_path
-
-    failed_creating_toc, docx_output_path = create_toc()
-    if failed_creating_toc:
-        return None
-
-    frontmatter = Path(temp_dir) / "TEMP00-coversheet-plus-toc.pdf"
-    if coversheet:
-        if coversheet_path and Path(coversheet_path).exists():
-            frontmatterfiles = [coversheet_path, toc_file_path]
-            log_msg = f"""
-                [CB]Coversheet specified. Calling merge_frontmatter [MF] with arguments:
-                ....frontmatterfiles: {frontmatterfiles}, frontmatter: {frontmatter}"""
-            dedent_and_log(bundle_logger, log_msg)
-            frontmatter_path = merge_frontmatter(frontmatterfiles, frontmatter)
-            if not Path(frontmatter_path).exists():
-                bundle_logger.exception(f"[CB]..Merging frontmatter unsuccessful: cannot locate expected ouput {frontmatter_path}.")
-                return None
-            bundle_logger.info(f"[CB]..Frontmatter created at {Path(frontmatter_path).name}")
-        else:
-            bundle_logger.exception(f"[CB]..Coversheet specified but not found at {coversheet_path}.")
-            return None
-    else:
-        frontmatter_path = toc_file_path
-        bundle_logger.info("[CB]No coversheet specified. TOC is the only frontmatter.")
-
-    with Pdf.open(frontmatter_path) as frontmatter_pdf:
-        length_of_frontmatter = len(frontmatter_pdf.pages)
-        bundle_logger.debug(f"[CB]Frontmatter length is {length_of_frontmatter} pages.")
-        if not bundle_config.roman_for_preface:
-            if length_of_frontmatter != expected_length_of_frontmatter:
-                bundle_logger.exception(
-                    f"[CB]..Frontmatter length mismatch: expected {length_of_frontmatter} pages, got {expected_length_of_frontmatter}."
-                )
-                return None
-            bundle_logger.info(f"[CB]..Frontmatter length matches expected {length_of_dummy_toc} pages.")
-
-    with Pdf.open(frontmatter_path) as frontmatter_pdf, Pdf.open(merged_paginated_no_toc) as main_pdf:
-        merged_pdf = Pdf.new()
-        merged_pdf.pages.extend(frontmatter_pdf.pages)
-        merged_pdf.pages.extend(main_pdf.pages)
-        merged_pdf.save(merged_file_with_frontmatter)
-    if not Path(merged_file_with_frontmatter).exists():
-        bundle_logger.exception(
-            f"[CB]..Merging frontmatter with main docs unsuccessful: cannot locate expected ouput {merged_file_with_frontmatter}."
+        docx_output_path = temp_path / "docx_output.docx"
+        docx_config = DocxConfig(
+            confidential=bundle_config.confidential_bool,
+            date_setting=(bundle_config.date_setting != "hide_date"),
+            index_font_setting=bundle_config.index_font,
         )
-        return None
+        case_details_list = [
+            bundle_config.case_details.get('bundle_title', ''),
+            bundle_config.case_details.get('claim_no', ''),
+            bundle_config.case_details.get('case_name', '')
+        ]
+        create_toc_docx(toc_entries, case_details_list, docx_output_path, docx_config)
+    except Exception:
+        bundle_logger.exception("[CB]..Error during create_toc_docx")
+    return docx_output_path
+
+
+def create_toc_pdf_tex(toc_entries, casedetails, output_file, config: TocTexConfig):
+    """Generate a table of contents PDF using TeX."""
+    bundle_name = sanitise_latex(casedetails[0])
+    page_offset = 0 if config.dummy else config.frontmatter_offset + 1
+    date_col_hdr, date_col_width = ("Date", "3.5cm") if config.date_setting != "hide_date" else ("", "0.3cm")
+    claimno_hdr = sanitise_latex(casedetails[1]) if casedetails[1] else ""
+    casename = sanitise_latex(casedetails[2]) if casedetails[2] else ""
+    footer_alignment_setting, footer_font, footer_text, index_font_family, starting_page = _create_tex_footer_string(config)
+
+    # Define the helper function for non-roman numbering
+    def get_non_roman_pagestyle():
+        return f"""
+        \\newcommand{{\\fontsetting}}{{\\fontfamily{{{footer_font}}}\\fontseries{{b}}\\base_font_size{{18}}{{22}}\\selectfont}}
+        \\setcounter{{page}}{{{starting_page}}}
+        \\begin{{document}}
+        \\pagestyle{{fancy}}
+        \\renewcommand{{\\headrulewidth}}{{0pt}}
+        \\setlength{{\\footskip}}{{20pt}}
+        \\fancyhf{{}} % to clear the header and the footer simultaneously
+        \\fancyfoot[{footer_alignment_setting}]{{\\fontsetting {footer_text}}}
+        """
+
+    # Define the bundle name header
+    bundle_header = (
+        f'\\textbf{{\\large{{\\textcolor{{red}}{{"CONFIDENTIAL"}}\\\\ {bundle_name.upper()}}}}} \\\\'
+        if config.confidential
+        else f"\\textbf{{\\Large{{{bundle_name.upper()}}}}} \\\\"
+    )
+
+    # Build all the parts of the LaTeX document
+    parts = [
+        r"""
+\documentclass[12pt,a4paper]{article}
+\usepackage{fancyhdr}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{longtable}
+\usepackage{color, colortbl}
+""",
+        r"\usepackage{xcolor}" if config.confidential else "",
+        r"""
+\geometry{a4paper, hmargin=2.5cm,vmargin=2cm}
+\definecolor{Gray}{gray}{0.9}
+""",
+        get_non_roman_pagestyle()
+        if not config.roman_numbering
+        else r"""
+\begin{document}
+\pagestyle{empty}
+""",
+        rf"\fontfamily{{{index_font_family}}}\selectfont" if index_font_family else "",
+        rf"\hfill\textbf{{\normalsize{{{claimno_hdr}}}}} \\" if claimno_hdr else "",
+        r"\vspace{{-0.5cm}}" if claimno_hdr else "",
+        rf"""
+\begin{{center}}
+\textbf{{\large{{{casename}}}}} \\
+\end{{center}}
+"""
+        if casename
+        else "",
+        rf"""
+\begin{{center}}
+\rule{{0.5\linewidth}}{{0.3mm}} \\
+\vspace{{0.3cm}}
+{bundle_header}
+\rule{{0.5\linewidth}}{{0.3mm}} \\
+\vspace{{-0.5cm}}
+\end{{center}}
+"""
+        if bundle_name
+        else "",
+        rf"""
+\def\arraystretch{{1.3}}
+\begin{{longtable}}{{p{{1.2cm}} p{{10cm}} p{{{date_col_width}}} r}}
+\hline
+\textbf{{Tab}} & \textbf{{Title}} & \textbf{{{date_col_hdr}}} & \textbf{{Page}} \\
+\hline
+\endfirsthead
+\hline
+\textbf{{Tab}} & \textbf{{Title}} & \textbf{{{date_col_hdr}}} & \textbf{{Page}} \\
+\hline
+\endhead
+\hline
+\endfoot
+\hline
+\endlastfoot
+""",
+        "".join(
+            [
+                r"\hline \rowcolor{Gray}\multicolumn{4}{l}{\textbf{" + entry[1] + r"}} \\ \hline "
+                if "SECTION_BREAK" in entry[0]
+                else (
+                    f"{sanitise_latex(entry[0])} & "
+                    f"{sanitise_latex(entry[1])} & "
+                    f"{'' if config.date_setting == 'hide_date' else sanitise_latex(entry[2])} & "
+                    f"{999 if config.dummy else entry[3] + page_offset} \\\\"
+                )
+                for entry in toc_entries
+            ]
+        ),
+        r"""
+\end{longtable}
+\newpage
+\pagenumbering{arabic}
+\end{document}
+""",
+    ]
+
+    # Join all parts, filtering out empty strings
+    toc_content = "".join(part for part in parts if part)
+
+    # Determine output paths
+    if config.dummy:
+        toc_tex_path = Path(output_file).parent / "dummytoc.tex"
+        jobname = "dummytoc"
+    else:
+        jobname = "toc"
+        toc_tex_path = Path(output_file).parent / "toc.tex"
+
+    # Write the LaTeX content to file
+    with Path(toc_tex_path).open("w") as f:
+        f.write(toc_content)
+
+    # Compile the LaTeX document
+    if Path(toc_tex_path).exists():
+        bundle_logger.debug(f"[CTP]TOC content written to file: {toc_tex_path}")
+        result = os.system(f"pdflatex -output-directory {Path(output_file).parent} -jobname={jobname} {toc_tex_path} > /dev/null")
+        if result != 0:
+            bundle_logger.error(f"[CTP]..pdflatex command failed with error code {result}")
+        else:
+            bundle_logger.debug("[CTP]..pdflatex command succeeded.")
+    else:
+        bundle_logger.error(f"[CTP]Error writing TOC content to file: {toc_tex_path}")
+
+
+class BundleLastLegParams(NamedTuple):
+    merged_file_with_frontmatter: Path
+    length_of_coversheet: int | None
+    bundle_config: BundleConfig
+    temp_dir: Path
+    hyperlinked_file: Path
+    main_bookmarked_file: Path
+    index_bookmarked_file: Path
+    coversheet_path: Path | None
+    frontmatter_path: Path
+    length_of_frontmatter: int
+    toc_entries: list
+    tmp_output_file: Path
+
+class HyperlinkingError(Exception):
+    details: str
+    def __init__(self, option, details):
+        self.details = details
+        super().__init__(f"Hyperlinking process failed: {option}")
+
+class BookmarkingError(Exception):
+    def __init__(self, option, details):
+        self.details = details
+        super().__init__(f"Bookmarking process failed: {option}")
+
+class PageLabelsError(Exception):
+    def __init__(self, option, details):
+        self.details = details
+        super().__init__(f"Page labels process failed: {option}")
+
+def bundle_last_leg(bundle_last_leg_params: BundleLastLegParams):
+    (
+        merged_file_with_frontmatter,
+        length_of_coversheet,
+        bundle_config,
+        _,  # temp_dir is not used in this function
+        hyperlinked_file,
+        main_bookmarked_file,
+        index_bookmarked_file,
+        coversheet_path,
+        frontmatter_path,
+        length_of_frontmatter,
+        toc_entries,
+        tmp_output_file,
+    ) = bundle_last_leg_params
 
     bundle_logger.debug("[[CB]Beginning hyperlinking process")
 
@@ -1926,36 +1918,35 @@ def _assemble_final_bundle(
     dedent_and_log(bundle_logger, log_msg)
     try:
         add_hyperlinks(
-            merged_file_with_frontmatter,
-            hyperlinked_file,
-            length_of_coversheet,
-            length_of_frontmatter,
-            toc_entries,
-            bundle_config.date_setting,
-            bundle_config.roman_for_preface,
+            AddHyperlinksParams(
+                merged_file_with_frontmatter,
+                hyperlinked_file,
+                length_of_coversheet if length_of_coversheet is not None else 0,
+                length_of_frontmatter,
+                toc_entries,
+                bundle_config.date_setting,
+                bundle_config.roman_for_preface,
+            )
         )
-    except Exception:
-        bundle_logger.exception("[CB]..Error during add_hyperlinks")
-        raise
+    except Exception as e:
+        raise HyperlinkingError("A", "[CB]..Error during add_hyperlinks") from e
     if not Path(hyperlinked_file).exists():
-        bundle_logger.exception(f"[CB]..Hyperlinking file unsuccessful: cannot locate expected ouput {hyperlinked_file}.")
-        return None
+        raise HyperlinkingError("B", f"[CB]..Hyperlinking file unsuccessful: cannot locate expected ouput {hyperlinked_file}.")
+
 
     log_msg = f"""
-        [CB]Calling add_bookmarks_to_pdf [AB] with arguments:
-        ....hyperlinked_file: {hyperlinked_file}
-        ....main_bookmarked_file: {main_bookmarked_file}
-        ....toc_entries: {toc_entries}
-        ....length_of_frontmatter: {length_of_frontmatter}"""
+    [CB]Calling add_bookmarks_to_pdf [AB] with arguments:
+    ....hyperlinked_file: {hyperlinked_file}
+    ....main_bookmarked_file: {main_bookmarked_file}
+    ....toc_entries: {toc_entries}
+    ....length_of_frontmatter: {length_of_frontmatter}"""
     dedent_and_log(bundle_logger, log_msg)
     try:
         add_bookmarks_to_pdf(hyperlinked_file, main_bookmarked_file, toc_entries, length_of_frontmatter, bundle_config)
-    except Exception:
-        bundle_logger.exception("[CB]..Error during add_bookmarks_to_pdf")
-        raise
+    except Exception as e:
+        raise BookmarkingError("A", "[CB]..Error during add_bookmarks_to_pdf") from e
     if not Path(main_bookmarked_file).exists():
-        bundle_logger.exception(f"[CB]..Bookmarking file unsuccessful: cannot locate expected ouput {main_bookmarked_file}.")
-        return None
+        raise BookmarkingError("B", f"[CB]..Bookmarking file unsuccessful: cannot locate expected ouput {main_bookmarked_file}.")
 
     log_msg = f"""
         [CB]Calling bookmark_the_index [BI] with arguments:
@@ -1965,12 +1956,10 @@ def _assemble_final_bundle(
     dedent_and_log(bundle_logger, log_msg)
     try:
         bookmark_the_index(main_bookmarked_file, index_bookmarked_file, coversheet_path)
-    except Exception:
-        bundle_logger.exception("[CB]..Error during bookmark_the_index")
-        raise
+    except Exception as e:
+        raise BookmarkingError("C", "[CB]..Error during bookmark_the_index") from e
     if not Path(index_bookmarked_file).exists():
-        bundle_logger.exception(f"[CB]..Bookmarking index file unsuccessful: cannot locate expected ouput {index_bookmarked_file}.")
-        return None
+        raise BookmarkingError("D", f"[CB]..Bookmarking index file unsuccessful: cannot locate expected ouput {index_bookmarked_file}.")
 
     if bundle_config.roman_for_preface:
         log_msg = f"""
@@ -1981,23 +1970,254 @@ def _assemble_final_bundle(
         dedent_and_log(bundle_logger, log_msg)
         try:
             add_roman_labels(index_bookmarked_file, length_of_frontmatter, tmp_output_file)
-        except Exception:
-            bundle_logger.exception("[CB]..Error during add_roman_labels")
-            raise
+        except Exception as e:
+            raise PageLabelsError("A", "[CB]..Error during add_roman_labels") from e
         if not Path(tmp_output_file).exists():
-            bundle_logger.exception(f"[CB]..Adding page labels unsuccessful: cannot locate expected ouput {tmp_output_file}.")
-            return None
+            raise PageLabelsError("B", f"[CB]..Adding page labels unsuccessful: cannot locate expected ouput {tmp_output_file}.")
         bundle_logger.info(f"[CB]..Page labels added to PDF saved to {tmp_output_file}")
     else:
         shutil.copyfile(index_bookmarked_file, tmp_output_file)
 
     bundle_logger.info(f"[CB]Completed bundle creation. output written to: {tmp_output_file}")
 
+class AssembleFinalBundleParams(NamedTuple):
+    bundle_config: BundleConfig
+    temp_path: Path
+    merged_file: Path
+    expected_length_of_frontmatter: int
+    toc_entries: list
+    length_of_coversheet: int | None
+    length_of_dummy_toc: int | None
+    coversheet: bool
+    coversheet_path: Path | None
+    tmp_output_file: Path
+
+class PathsTuple(NamedTuple):
+    merged_paginated_no_toc: Path
+    page_numbers_pdf: Path
+    page_numbers_aux: Path
+    page_numbers_tex: Path
+    toc_file_path: Path
+    toc_out: Path
+    toc_log: Path
+    toc_aux: Path
+    toc_tex: Path
+    merged_file_with_frontmatter: Path
+    hyperlinked_file: Path
+    main_bookmarked_file: Path
+    index_bookmarked_file: Path
+
+def get_paths(temp_path: Path):
+    # Define all potential temporary file paths upfront
+    merged_paginated_no_toc = temp_path / "TEMP03_paginated_mainpages.pdf"
+    page_numbers_pdf = temp_path / "pageNumbers.pdf"
+    page_numbers_aux = temp_path / "pageNumbers.aux"
+    page_numbers_tex = temp_path / "pageNumbers.tex"
+    toc_file_path = temp_path / "index.pdf"
+    toc_out = temp_path / "index.out"
+    toc_log = temp_path / "index.log"
+    toc_aux = temp_path / "index.aux"
+    toc_tex = temp_path / "toc.tex"
+    merged_file_with_frontmatter = temp_path / "TEMP04_all_pages.pdf"
+    hyperlinked_file = temp_path / "TEMP05-hyperlinked.pdf"
+    main_bookmarked_file = temp_path / "TEMP06_main_bookmarks.pdf"
+    index_bookmarked_file = temp_path / "TEMP07_all_bookmarks.pdf"
+    return PathsTuple(merged_paginated_no_toc, page_numbers_pdf, page_numbers_aux, page_numbers_tex, toc_file_path, toc_out, toc_log, toc_aux,
+        toc_tex, merged_file_with_frontmatter, hyperlinked_file, main_bookmarked_file, index_bookmarked_file)
+
+class PaginationError(Exception):
+    """Custom exception for pagination errors."""
+
+    def __init__(self, option):
+        self.message = f"Pagination process failed: {option}"
+        super().__init__(self.message)
+
+def paginate_merged_main_files(merged_file, merged_paginated_no_toc, bundle_config: BundleConfig):
+    # Next step: paginate the merged main files of the PDF (the main content)
+    log_msg = f"""
+        [CB]Calling pdf_paginator_reportlab [PPRL] with arguments:
+        ....merged_file: {merged_file}
+        ....merged_paginated_no_toc: {merged_paginated_no_toc}
+        ....page_num_alignment: {bundle_config.page_num_align}
+        ....page_num_font: {bundle_config.footer_font}
+        ....page_numbering_style: {bundle_config.page_num_style}
+        ....footer_prefix: {bundle_config.footer_prefix}"""
+    dedent_and_log(bundle_logger, log_msg)
+    try:
+        paginated_page_count = pdf_paginator_reportlab(merged_file, bundle_config, merged_paginated_no_toc)
+    except Exception as e:
+        bundle_logger.exception("[CB]..Error during pdf_paginator_reportlab")
+        paginated_page_count = 0
+        raise PaginationError("A") from e
+    if not Path(merged_paginated_no_toc).exists():
+        bundle_logger.error(f"[CB]..Paginating file unsuccessful: cannot locate expected ouput {merged_paginated_no_toc}.")
+        raise PaginationError("B")
+
+    assert paginated_page_count == bundle_config.main_page_count
+
+class FrontMatterError(Exception):
+    details: str
+    def __init__(self, option, details):
+        self.details = details
+        super().__init__(f"Frontmatter process failed: {option}")
+
+class SaveMergedFilesWithFrontmasterParams(NamedTuple):
+    temp_path: Path
+    toc_file_path: Path
+    coversheet: bool
+    coversheet_path: Path | None
+    bundle_config: BundleConfig
+    expected_length_of_frontmatter: int
+    length_of_dummy_toc: int | None
+    merged_paginated_no_toc: Path
+    merged_file_with_frontmatter: Path
+
+def save_merged_files_with_frontmaster(get_front_matter_path_params: SaveMergedFilesWithFrontmasterParams):
+    (
+        temp_path,
+        toc_file_path,
+        coversheet,
+        coversheet_path,
+        bundle_config,
+        expected_length_of_frontmatter,
+        length_of_dummy_toc,
+        merged_paginated_no_toc,
+        merged_file_with_frontmatter
+    ) = get_front_matter_path_params
+
+    frontmatter = temp_path / "TEMP00-coversheet-plus-toc.pdf"
+    if coversheet:
+        if coversheet_path and Path(coversheet_path).exists():
+            frontmatterfiles = [coversheet_path, toc_file_path]
+            log_msg = f"""
+                [CB]Coversheet specified. Calling merge_frontmatter [MF] with arguments:
+                ....frontmatterfiles: {frontmatterfiles}, frontmatter: {frontmatter}"""
+            dedent_and_log(bundle_logger, log_msg)
+            frontmatter_path = merge_frontmatter(frontmatterfiles, frontmatter)
+            if not Path(frontmatter_path).exists():
+                raise FrontMatterError("A", f"[CB]..Merging frontmatter unsuccessful: cannot locate expected ouput {frontmatter_path}.")
+            bundle_logger.info(f"[CB]..Frontmatter created at {Path(frontmatter_path).name}")
+        else:
+            raise FrontMatterError("B", f"[CB]..Coversheet specified but not found at {coversheet_path}.")
+    else:
+        frontmatter_path = toc_file_path
+        bundle_logger.info("[CB]No coversheet specified. TOC is the only frontmatter.")
+
+    with Pdf.open(frontmatter_path) as frontmatter_pdf:
+        length_of_frontmatter = len(frontmatter_pdf.pages)
+        bundle_logger.debug(f"[CB]Frontmatter length is {length_of_frontmatter} pages.")
+        if not bundle_config.roman_for_preface:
+            if length_of_frontmatter != expected_length_of_frontmatter:
+                error_msg = (
+                    f"[CB]..Frontmatter length mismatch: expected {length_of_frontmatter} pages, "
+                    f"got {expected_length_of_frontmatter}."
+                )
+                raise FrontMatterError("C", error_msg)
+            bundle_logger.info(f"[CB]..Frontmatter length matches expected {length_of_dummy_toc} pages.")
+
+    with Pdf.open(frontmatter_path) as frontmatter_pdf, Pdf.open(merged_paginated_no_toc) as main_pdf:
+        merged_pdf = Pdf.new()
+        merged_pdf.pages.extend(frontmatter_pdf.pages)
+        merged_pdf.pages.extend(main_pdf.pages)
+        merged_pdf.save(merged_file_with_frontmatter)
+    if not Path(merged_file_with_frontmatter).exists():
+        bundle_logger.exception(
+            f"[CB]..Merging frontmatter with main docs unsuccessful: cannot locate expected ouput {merged_file_with_frontmatter}."
+        )
+        raise FrontMatterError("D", \
+                            f"[CB]..Merging frontmatter with main docs unsuccessful: cannot locate expected ouput {merged_file_with_frontmatter}.")
+    bundle_logger.info(f"[CB]..Merged frontmatter with main docs at {merged_file_with_frontmatter}")
+    return frontmatter_path, length_of_frontmatter
+
+def _assemble_final_bundle(
+    assemble_final_bundle_params: AssembleFinalBundleParams,
+):
+    """Assembles the final PDF bundle by paginating, creating TOC, and adding bookmarks. Returns a list of created temp files."""
+    (
+        bundle_config,
+        temp_dir,
+        merged_file,
+        expected_length_of_frontmatter,
+        toc_entries,
+        length_of_coversheet,
+        length_of_dummy_toc,
+        coversheet,
+        coversheet_path,
+        tmp_output_file
+    ) = assemble_final_bundle_params
+
+    temp_path = Path(temp_dir)
+
+    (   merged_paginated_no_toc,
+        page_numbers_pdf,
+        page_numbers_aux,
+        page_numbers_tex,
+        toc_file_path,
+        toc_out,
+        toc_log,
+        toc_aux,
+        toc_tex,
+        merged_file_with_frontmatter,
+        hyperlinked_file,
+        main_bookmarked_file,
+        index_bookmarked_file
+    ) = get_paths(temp_path)
+
+    try:
+        paginate_merged_main_files(merged_file, merged_paginated_no_toc, bundle_config)
+        docx_output_path = _create_toc(TocParams(
+            bundle_config, temp_path, toc_entries, length_of_coversheet, expected_length_of_frontmatter, toc_file_path
+        ))
+    except Exception as e:
+        if isinstance(e, CreateTocError):
+            bundle_logger.exception(f"[CB]..Creating TOC file unsuccessful: cannot locate expected output {toc_file_path}.")
+        elif isinstance(e, PaginationError):
+            bundle_logger.exception("[CB]..paginate_merged_main_files failed.")
+        return None
+
+    try:
+        frontmatter_path, length_of_frontmatter = save_merged_files_with_frontmaster(SaveMergedFilesWithFrontmasterParams(
+            temp_path, toc_file_path, coversheet, coversheet_path, bundle_config, expected_length_of_frontmatter,
+            length_of_dummy_toc, merged_paginated_no_toc, merged_file_with_frontmatter
+        ))
+    except FrontMatterError:
+        bundle_logger.exception("CB..Saving merged files with frontmatter failed.")
+        return None
+
+    try:
+        bundle_last_leg(BundleLastLegParams(
+            merged_file_with_frontmatter=merged_file_with_frontmatter,
+            length_of_coversheet=length_of_coversheet,
+            bundle_config=bundle_config,
+            temp_dir=temp_path,
+            hyperlinked_file=hyperlinked_file,
+            main_bookmarked_file=main_bookmarked_file,
+            index_bookmarked_file=index_bookmarked_file,
+            coversheet_path=coversheet_path,
+            frontmatter_path=frontmatter_path,
+            length_of_frontmatter=length_of_frontmatter,
+            toc_entries=toc_entries,
+            tmp_output_file=tmp_output_file))
+    except Exception as e:
+        if isinstance(e, HyperlinkingError):
+            bundle_logger.exception("[CB]..Hyperlinking process failed.")
+        elif isinstance(e, BookmarkingError):
+            bundle_logger.exception("[CB]..Bookmarking process failed.")
+        elif isinstance(e, PageLabelsError):
+            bundle_logger.exception("[CB]..Page labeling process failed.")
+        return None
+
     # Return the path to the docx and the list of all temp files created in this function
     return docx_output_path, [
         merged_paginated_no_toc,
-        page_numbers_pdf, page_numbers_aux, page_numbers_tex,
-        toc_file_path, toc_out, toc_log, toc_aux, toc_tex,
+        page_numbers_pdf,
+        page_numbers_aux,
+        page_numbers_tex,
+        toc_file_path,
+        toc_out,
+        toc_log,
+        toc_aux,
+        toc_tex,
         merged_file_with_frontmatter,
         hyperlinked_file,
         main_bookmarked_file,
@@ -2005,31 +2225,33 @@ def _assemble_final_bundle(
     ]
 
 
-def create_bundle(input_files, output_file, coversheet, index_file, bundle_config_data):
+def create_bundle(input_files, output_file, coversheet, index_file, bundle_config_data: BundleConfig):
     """Create a bundle from input files and configuration."""
     docx_output_path = None
     toc_file_path = None
 
-    bundle_config, temp_dir, tmp_output_file, coversheet_path, initial_temp_files = _initialize_bundle_creation(
+    bundle_config, temp_path, tmp_output_file, coversheet_path, initial_temp_files = _initialize_bundle_creation(
         bundle_config_data, output_file, coversheet, input_files, index_file
     )
 
     try:
-        index_data, toc_entries, merge_temp_files, main_page_count = _process_index_and_merge(
-            bundle_config, index_file, temp_dir, input_files
-        )
+        index_data, toc_entries, merge_temp_files, main_page_count = _process_index_and_merge(bundle_config, index_file, temp_path, input_files)
         if not merge_temp_files:
             return None, None
 
         expected_length_of_frontmatter, length_of_coversheet, length_of_dummy_toc, frontmatter_temp_files = _create_front_matter(
-            bundle_config, coversheet, coversheet_path, temp_dir, toc_entries
+            bundle_config, coversheet, coversheet_path, temp_path, toc_entries
         )
         if expected_length_of_frontmatter is None:
             return None, None
 
+        if toc_entries is None:
+            bundle_logger.error("[CB]toc_entries is None, cannot assemble bundle.")
+            return None, None
+
         result = _assemble_final_bundle(
-            bundle_config,
-            temp_dir,
+            AssembleFinalBundleParams(bundle_config,
+            temp_path,
             merge_temp_files[0],  # Pass the path to the merged file
             expected_length_of_frontmatter,
             toc_entries,
@@ -2037,7 +2259,8 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
             length_of_dummy_toc,
             coversheet,
             coversheet_path,
-            tmp_output_file,
+            tmp_output_file
+            )
         )
         if result is None:
             bundle_logger.error("[CB].._assemble_final_bundle failed.")
@@ -2045,9 +2268,7 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
         docx_output_path, final_bundle_temp_files = result
 
         # Combine all temporary files at the end
-        created_temp_files = (
-            merge_temp_files + (frontmatter_temp_files or []) + (final_bundle_temp_files or [])
-        )
+        created_temp_files = merge_temp_files + (frontmatter_temp_files or []) + (final_bundle_temp_files or [])
 
     except Exception:
         bundle_logger.exception("[CB]Error during create_bundle")
@@ -2057,20 +2278,23 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
     zip_filepath = None
     if bundle_config.zip_bool:
         zip_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-        bundletitleforfilename = bundle_config.case_details[0] or "Bundle"
+        bundletitleforfilename = bundle_config.case_details["bundle_title"] or "Bundle"
+        casenameforfilename = bundle_config.case_details["case_name"] or ""
         bundle_logger.debug("[CB]Calling create_zip_file:")
         try:
             zip_filepath = create_zip_file(
-                bundletitleforfilename,
-                bundle_config.case_details[2],
-                zip_timestamp,
-                input_files,
-                index_file,
-                docx_output_path,
-                toc_file_path,
-                coversheet_path,
-                temp_dir,
-                tmp_output_file,
+                CreateZipFileParams(
+                    bundletitleforfilename,
+                    casenameforfilename,
+                    zip_timestamp,
+                    input_files,
+                    index_file,
+                    docx_output_path,
+                    toc_file_path,
+                    coversheet_path,
+                    temp_path,
+                    tmp_output_file,
+                )
             )
         except Exception:
             bundle_logger.exception("[CB]..Error during create_zip_file")
@@ -2092,24 +2316,39 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
     return str(tmp_output_file), final_zip_path
 
 
-def create_zip_file(
-    bundle_title,
-    case_name,
-    timestamp,
-    input_files,
-    csv_path,
-    docx_path,
-    toc_path,
-    coversheet_path,
-    temp_dir,
-    tmp_output_file,
-):
+class CreateZipFileParams(NamedTuple):
+    bundle_title: str
+    case_name: str
+    timestamp: str
+    input_files: list
+    csv_path: str
+    docx_path: Path | None
+    toc_path: Path | None
+    coversheet_path: Path | None
+    temp_path: Path
+    tmp_output_file: str
+
+
+def create_zip_file(create_zip_file_params: CreateZipFileParams):
     """Package up everything into a zip for the user's reproducibility and record keeping.
 
     for the user's reproducability and record keeping.
     """
+    (
+        bundle_title,
+        case_name,
+        timestamp,
+        input_files,
+        csv_path,
+        docx_path,
+        toc_path,
+        coversheet_path,
+        temp_dir,
+        tmp_output_file
+    ) = create_zip_file_params
+
     # int_zip_filepath = os.path.join(temp_dir, zip_filename)
-    int_zip_filepath = Path(temp_dir) / f"{bundle_title}_{timestamp}.zip"
+    int_zip_filepath = Path(temp_dir) / f"{bundle_title}_{case_name}_{timestamp}.zip"
     bundle_logger.debug(f"[CZF]Creating zip file at {int_zip_filepath}")
 
     with zipfile.ZipFile(int_zip_filepath, "w") as zipf:
@@ -2164,20 +2403,22 @@ def main():
     zip_bool = args.zip if args.zip else False
 
     bundle_config = BundleConfig(
-        timestamp=timestamp,
-        case_details=casedetails,
-        csv_string=csv_index,
-        confidential_bool=confidential_bool,
-        zip_bool=zip_bool,
-        session_id=timestamp,
-        user_agent="CLI",
-        page_num_align="centre",
-        index_font="sans",
-        footer_font="sans",
-        page_num_style="page_x_of_y",
-        footer_prefix="",
-        date_setting="DD_MM_YYYY",
-        roman_for_preface=False,
+        BundleConfigParams(
+            timestamp=timestamp,
+            case_details={"bundle_title": casedetails[0], "claim_no": casedetails[1], "case_name": casedetails[2]},
+            csv_string=csv_index,
+            confidential_bool=confidential_bool,
+            zip_bool=zip_bool,
+            session_id=timestamp,
+            user_agent="CLI",
+            page_num_align="centre",
+            index_font="sans",
+            footer_font="sans",
+            page_num_style="page_x_of_y",
+            footer_prefix="",
+            date_setting="DD_MM_YYYY",
+            roman_for_preface=False,
+        )
     )
 
     create_bundle(

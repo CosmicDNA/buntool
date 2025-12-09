@@ -9,13 +9,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from colorlog import ColoredFormatter
 from flask import Flask, current_app, jsonify, render_template, request, send_file
 from waitress import serve
 from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
 from buntool import bundle
-from buntool.logger import ColorFormatter
+from buntool.bundle_config import BundleConfigParams
 
 #import boto3
 
@@ -111,26 +112,32 @@ def _get_bundle_config_from_form(form: dict, context: RequestContext, logs_dir: 
     bundle_title = form.get('bundle_title', 'Bundle') if form.get('bundle_title') else 'Bundle'
     case_name = form.get('case_name')
     claim_no = form.get('claim_no')
-    case_details = [bundle_title, claim_no, case_name]
+    case_details = {
+        'bundle_title': bundle_title,
+        'claim_no': claim_no or '',
+        'case_name': case_name or ''
+    }
 
     return bundle.BundleConfig(
-        timestamp=context.timestamp,
-        case_details=case_details,
-        csv_string=None,
-        confidential_bool=form.get('confidential_bool'),
-        zip_bool=True,  # option not implemented for GUI control.
-        session_id=context.session_id,
-        user_agent=context.user_agent,
-        page_num_align=form.get('page_num_align'),
-        index_font=form.get('index_font'),
-        footer_font=form.get('footer_font'),
-        page_num_style=form.get('page_num_style'),
-        footer_prefix=form.get('footer_prefix'),
-        date_setting=form.get('date_setting'),
-        roman_for_preface=strtobool(form.get('roman_for_preface', 'false')),
-        temp_dir=context.temp_dir,
-        logs_dir=logs_dir,
-        bookmark_setting=form.get('bookmark_setting', 'tab-title')
+        BundleConfigParams(
+            timestamp=context.timestamp,
+            case_details=case_details,
+            csv_string='',
+            confidential_bool=strtobool(form.get('confidential_bool', 'false')),
+            zip_bool=True,  # option not implemented for GUI control.
+            session_id=context.session_id,
+            user_agent=context.user_agent,
+            page_num_align=form.get('page_num_align', ''),
+            index_font=form.get('index_font', ''),
+            footer_font=form.get('footer_font', ''),
+            page_num_style=form.get('page_num_style', ''),
+            footer_prefix=form.get('footer_prefix', ''),
+            date_setting=form.get('date_setting', ''),
+            roman_for_preface=strtobool(form.get('roman_for_preface', 'false')),
+            temp_dir=context.temp_dir,
+            logs_dir=logs_dir,
+            bookmark_setting=form.get('bookmark_setting', 'tab-title')
+        )
     )
 
 def save_uploaded_file(file: FileStorage, directory, filename=None):
@@ -189,7 +196,7 @@ def _handle_csv_index_upload(request_files: dict[str, FileStorage], temp_dir: Pa
 
         if not saved_csv_path or not Path(saved_csv_path).exists():
             msg = f"Index data did not upload correctly. Session code: {session_id}"
-            current_app.logger.exception(f"CSV file not found or failed to save at path: {saved_csv_path}")
+            current_app.logger.error(f"CSV file not found or failed to save at path: {saved_csv_path}")
             # We return a tuple (error_response, None) to be handled by the caller
             return jsonify({"status": "error", "message": msg}), 400, None
 
@@ -204,7 +211,7 @@ def _build_and_respond(received_output_file, zip_file_path, session_id):
 
     if not (received_output_file and Path(received_output_file).exists()):
         msg = f"Error preparing PDF file for download. Session code: {session_id}"
-        current_app.logger.exception(f"PDF file not found at: {received_output_file}")
+        current_app.logger.error(f"PDF file not found at: {received_output_file}")
         return jsonify({"status": "error", "message": msg}), 500
 
     final_output_path = bundles_dir / Path(received_output_file).name
@@ -245,7 +252,7 @@ def create_bundle():
     current_app.logger.debug(f"New session ID: {session_id} {user_agent}")
 
     if 'files' not in request.files:
-        current_app.logger.exception("Cannot create bundle: No files found in form submission")
+        current_app.logger.error("Cannot create bundle: No files found in form submission")
         return jsonify({"status": "error", "message": "No files found. Please add files and try again."}), 400
 
     logs_dir = Path(tempfile.gettempdir()) / 'logs' if is_running_in_lambda() else Path('logs')
@@ -273,7 +280,7 @@ def create_bundle():
         )
 
         bundle_config = _get_bundle_config_from_form(request.form, context, logs_dir)
-        output_file = get_output_filename(bundle_config.case_details[0], bundle_config.case_details[1], timestamp, \
+        output_file = get_output_filename(bundle_config.case_details['bundle_title'], bundle_config.case_details['case_name'], timestamp, \
                                           bundle_config.footer_prefix or "Bundle")
         current_app.logger.debug(f"generated output filename: {output_file}")
 
@@ -281,7 +288,7 @@ def create_bundle():
         total_size = sum(f.content_length for f in files if f.content_length is not None)
         if total_size > current_app.config['MAX_CONTENT_LENGTH']:
             msg = f"Total size of files exceeds maximum allowed size: {total_size} > {current_app.config['MAX_CONTENT_LENGTH']}"
-            current_app.logger.exception(msg)
+            current_app.logger.error(msg)
             return jsonify({"status": "error", "message": msg}), 400
 
         input_files, filename_mappings = _process_uploaded_files(files, temp_dir)
@@ -352,7 +359,12 @@ def create_app():
     # Apply color formatter to the default console handler
     for handler in app.logger.handlers:
         if isinstance(handler, logging.StreamHandler):
-            handler.setFormatter(ColorFormatter('%(asctime)s - %(levelname)s - [APP]: %(message)s'))
+            formatter = ColoredFormatter(
+                '%(log_color)s%(asctime)s - %(levelname)s - [APP]: %(message)s',
+                log_colors={'DEBUG': 'cyan', 'INFO': 'green', 'WARNING': 'yellow', 'ERROR': 'red', 'CRITICAL': 'red,bg_white'},
+                reset=True
+            )
+            handler.setFormatter(formatter)
 
     logs_dir = Path(tempfile.gettempdir()) / 'logs' if is_running_in_lambda() else Path('logs')
     logs_dir.mkdir(parents=True, exist_ok=True)

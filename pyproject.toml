@@ -18,6 +18,8 @@ dependencies = [
     "pdfplumber",
     "reportlab",
     "python-docx",
+    "colorlog",
+    "werkzeug",
 ]
 
 [project.optional-dependencies]
