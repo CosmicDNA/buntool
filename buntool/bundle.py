@@ -77,6 +77,7 @@ from werkzeug.utils import secure_filename
 
 # custom
 from buntool.makedocxindex import DocxConfig, create_toc_docx
+from buntool.logger import ColorFormatter
 from buntool.textwrap_custom import dedent_and_log
 
 # Set globals
@@ -112,8 +113,9 @@ def configure_logger(bundle_config, session_id=None):
     bundle_logger.setLevel(logging.DEBUG)
     bundle_logger.propagate = False
     formatter = logging.Formatter("%(asctime)s-%(levelname)s-[BUN]: %(message)s")
+    color_formatter = ColorFormatter("%(asctime)s-%(levelname)s-[BUN]: %(message)s")
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+    console_handler.setFormatter(color_formatter)
     bundle_logger.addHandler(console_handler)
 
     if not session_id:

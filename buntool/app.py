@@ -15,6 +15,7 @@ from werkzeug.datastructures import FileStorage
 from werkzeug.utils import secure_filename
 
 from buntool import bundle
+from buntool.logger import ColorFormatter
 
 #import boto3
 
@@ -258,8 +259,8 @@ def create_bundle():
 
         logs_path = logs_dir / f'buntool_{session_id}.log'
         session_file_handler = logging.FileHandler(logs_path)
-        log_format = '%(asctime)s-%(levelname)s-[APP]: %(message)s'
-        file_formatter = logging.Formatter(log_format)
+        # Use a standard formatter for the file log
+        file_formatter = logging.Formatter('%(asctime)s-%(levelname)s-[APP]: %(message)s')
         session_file_handler.setLevel(logging.DEBUG)
         session_file_handler.setFormatter(file_formatter)
         current_app.logger.addHandler(session_file_handler)
@@ -347,6 +348,11 @@ def create_app():
     app = Flask(__name__)
     app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # file size limit in MB
     app.logger.setLevel(logging.DEBUG)
+
+    # Apply color formatter to the default console handler
+    for handler in app.logger.handlers:
+        if isinstance(handler, logging.StreamHandler):
+            handler.setFormatter(ColorFormatter('%(asctime)s - %(levelname)s - [APP]: %(message)s'))
 
     logs_dir = Path(tempfile.gettempdir()) / 'logs' if is_running_in_lambda() else Path('logs')
     logs_dir.mkdir(parents=True, exist_ok=True)
