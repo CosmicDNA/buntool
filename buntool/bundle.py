@@ -59,7 +59,7 @@ from pypdf.generic import NameObject as Name
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle, StyleSheet1, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -538,28 +538,75 @@ def _get_toc_pdf_styles(date_setting, index_font_setting):
     }
 
 
-def _create_reportlab_row(row_tuple, date_col_hdr, dummy, page_offset, styleSheet):
+def _create_header(row_tuple, style_sheet):
     """Creates a single formatted row for the ReportLab table."""
     row = list(row_tuple)
-    if all(x in row for x in ("Tab", "Title", "Date", "Page")):
+    # It's a regular data row
+    return [Paragraph(str(cell), style_sheet["header_style"]) for cell in row]
+
+class CreateReportlabRowParams(NamedTuple):
+    row_tuple: tuple
+    date_col_hdr: str
+    dummy: bool | None
+    page_offset: int
+    style_sheet: StyleSheet1
+    headers: tuple
+
+def _create_reportlab_row(create_reportlab_row_params: CreateReportlabRowParams):
+    """Creates a single formatted row for the ReportLab table."""
+    (
+        row_tuple,
+        date_col_hdr,
+        dummy,
+        page_offset,
+        style_sheet,
+        headers
+    ) = create_reportlab_row_params
+
+    row = list(row_tuple)
+    if all(x in row for x in headers):
         row[2] = date_col_hdr
-        return [Paragraph(cell, styleSheet["main_style"]) for cell in row]
+        return [Paragraph(cell, style_sheet["main_style"]) for cell in row]
     if "SECTION_BREAK" in row[0]:
         row[0] = ""
-        return [Paragraph(cell, styleSheet["bold_style"]) for cell in row]
+        return [Paragraph(cell, style_sheet["bold_style"]) for cell in row]
 
     # It's a regular data row
     row[3] = 9999 if dummy else row[3] + page_offset
-    return [Paragraph(str(cell), styleSheet["main_style"] if isinstance(cell, str) else styleSheet["main_style_right"]) for cell in row]
+    return [Paragraph(str(cell), style_sheet["main_style"] if isinstance(cell, str) else style_sheet["main_style_right"]) for cell in row]
 
+class TableDataParams(NamedTuple):
+    toc_entries: list[tuple]
+    date_col_hdr: str
+    dummy: bool | None
+    page_offset: int
+    style_sheet: StyleSheet1
+    bundle_title: str
 
-def _build_reportlab_table_data(toc_entries, date_col_hdr, dummy, page_offset, styleSheet):
+def _build_reportlab_table_data(table_data_params: TableDataParams):
     """Build the data structure for the ReportLab table."""
+    (
+        toc_entries,
+        date_col_hdr,
+        dummy,
+        page_offset,
+        style_sheet,
+        bundle_title
+    ) = table_data_params
     list_of_section_breaks = [rowidx for rowidx, current_row_tuple in enumerate(toc_entries) if "SECTION_BREAK" in current_row_tuple[0]]
 
-    reportlab_table_data = [_create_reportlab_row(row, date_col_hdr, dummy, page_offset, styleSheet) for row in toc_entries]
+    headers = ("Tab", "Title", "Date", "Page")
+    header_row = _create_header(headers, style_sheet)
+    reportlab_table_data = [
+        _create_reportlab_row(CreateReportlabRowParams(row, date_col_hdr, dummy, page_offset, style_sheet, headers))
+        for row in toc_entries
+    ]
 
-    return reportlab_table_data, list_of_section_breaks
+    reportlab_table_data.insert(0, header_row)  # Insert header row at the top
+
+    # Adjust section break indices to account for the inserted header row.
+    adjusted_section_breaks = [idx + 1 for idx in list_of_section_breaks]
+    return reportlab_table_data, adjusted_section_breaks
 
 
 def _setup_reportlab_styles(main_font, bold_font, base_font_size):
@@ -576,15 +623,24 @@ def _setup_reportlab_styles(main_font, bold_font, base_font_size):
     # Set up stylesheet for the various styles used..
     styleSheet = getSampleStyleSheet()
 
+
+    header_style = ParagraphStyle(
+        "header_style",
+        parent=styleSheet["Normal"],
+        fontName=bold_font,
+        fontSize=base_font_size,
+        leading=14,
+        alignment=TA_CENTER,
+    )
     main_style = ParagraphStyle(
-        "BodyText",
+        "main_style",
         parent=styleSheet["Normal"],
         fontName=main_font,
         fontSize=base_font_size,
         leading=14,
     )
     main_style_right = ParagraphStyle(
-        "BodyText",
+        "main_style_right",
         parent=styleSheet["Normal"],
         fontName=main_font,
         fontSize=base_font_size,
@@ -593,14 +649,14 @@ def _setup_reportlab_styles(main_font, bold_font, base_font_size):
     )
 
     bold_style = ParagraphStyle(
-        "BodyText",
+        "bold_style",
         parent=styleSheet["Normal"],
         fontName=bold_font,
         fontSize=base_font_size,
         leading=14,
     )
     claimno_style = ParagraphStyle(
-        "BodyText",
+        "claimno_style",
         parent=styleSheet["Normal"],
         fontName=bold_font,
         fontSize=base_font_size,
@@ -608,7 +664,7 @@ def _setup_reportlab_styles(main_font, bold_font, base_font_size):
         alignment=TA_RIGHT,
     )
     bundle_title_style = ParagraphStyle(
-        "BodyText",
+        "bundle_title_style",
         parent=styleSheet["Normal"],
         fontName=bold_font,
         fontSize=base_font_size + 6,
@@ -616,7 +672,7 @@ def _setup_reportlab_styles(main_font, bold_font, base_font_size):
         alignment=TA_CENTER,
     )
     case_name_style = ParagraphStyle(
-        "BodyText",
+        "case_name_style",
         parent=styleSheet["Normal"],
         fontName=bold_font,
         fontSize=base_font_size + 2,
@@ -624,13 +680,20 @@ def _setup_reportlab_styles(main_font, bold_font, base_font_size):
         alignment=TA_CENTER,
     )
 
-    styleSheet.add(ParagraphStyle(name="main_style", parent=main_style))
-    styleSheet.add(ParagraphStyle(name="main_style_right", parent=main_style_right))
-    styleSheet.add(ParagraphStyle(name="bold_style", parent=bold_style))
-    styleSheet.add(ParagraphStyle(name="claimno_style", parent=claimno_style))
-    styleSheet.add(ParagraphStyle(name="bundle_title_style", parent=bundle_title_style))
-    styleSheet.add(ParagraphStyle(name="case_name_style", parent=case_name_style))
-    # styleSheet.add(ParagraphStyle(name='footer_style', parent=footer_style))
+    styles = [
+        header_style,
+        main_style,
+        main_style_right,
+        bold_style,
+        claimno_style,
+        bundle_title_style,
+        case_name_style,
+        # footer_style,  # Footer style is not used in the TOC PDF
+    ]
+
+    for style in styles:
+        styleSheet.add(ParagraphStyle(name=style.name, parent=style))
+
     return styleSheet
 
 
@@ -684,11 +747,13 @@ def create_toc_pdf_reportlab(toc_entries, casedetails: dict[str, str], bundle_co
         )
     )
 
+
+    bundle_title = casedetails.get("bundle_title", "")
     # Now, the case name and bundle title:
     if not options.get("confidential"):
         header_table_data = [
             ["", Paragraph(casedetails.get("case_name", ""), styleSheet["case_name_style"]), ""],  # Case Name
-            ["", Paragraph(casedetails.get("bundle_title", ""), styleSheet["bundle_title_style"]), ""],  # Bundle Title
+            ["", Paragraph(bundle_title, styleSheet["bundle_title_style"]), ""],  # Bundle Title
         ]
     else:
         header_table_data = [
@@ -712,11 +777,11 @@ def create_toc_pdf_reportlab(toc_entries, casedetails: dict[str, str], bundle_co
         )
     )
 
-    # Third, the main toc entries able:
-    reportlab_table_data = []
+    style_sheet = styleSheet
 
+    # Third, the main toc entries able:
     reportlab_table_data, list_of_section_breaks = _build_reportlab_table_data(
-        toc_entries, date_col_hdr, options.get("dummy"), page_offset, styleSheet
+        TableDataParams(toc_entries, date_col_hdr, options.get("dummy"), page_offset, style_sheet, bundle_title)
     )
     toc_table = Table(
         reportlab_table_data,
