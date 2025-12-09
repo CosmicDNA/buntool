@@ -1411,12 +1411,14 @@ def _find_hyperlink_match_for_entry(
     find_hyperlink_match_for_entry_params: FindHyperlinkMatchForEntryParams,
 ) -> dict[str, int | str | tuple[float, float, float, float]] | None:
     """Find the coordinates and page for a single TOC entry to create a hyperlink."""
-    entry = find_hyperlink_match_for_entry_params.entry
-    scraped_pages_text = find_hyperlink_match_for_entry_params.scraped_pages_text
-    length_of_coversheet = find_hyperlink_match_for_entry_params.length_of_coversheet
-    length_of_frontmatter = find_hyperlink_match_for_entry_params.length_of_frontmatter
-    date_setting = find_hyperlink_match_for_entry_params.date_setting
-    roman_page_labels = find_hyperlink_match_for_entry_params.roman_page_labels
+    (
+        entry,
+        scraped_pages_text,
+        length_of_coversheet,
+        length_of_frontmatter,
+        date_setting,
+        roman_page_labels,
+    ) = find_hyperlink_match_for_entry_params
 
     def _create_search_patterns(entry_data):
         """Create regex patterns to find the TOC entry in the extracted text."""
