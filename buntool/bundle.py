@@ -383,7 +383,7 @@ def get_pages(input_files, filename) -> tuple[Pdf, list[Page]] | tuple[None, lis
             bundle_logger.exception(f"Error merging file {this_file_path}")
     return None, []
 
-def merge_pdfs_create_toc_entries(input_files, output_file, index_data, bundle_config):
+def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
     """Merge PDFs and create table of contents entries.
 
     index_data is the roadmap for the bundle creation.
@@ -413,7 +413,7 @@ def merge_pdfs_create_toc_entries(input_files, output_file, index_data, bundle_c
     # Now, merge the PDFs in the correct order
     non_section_breaks = [filename for filename, (_, _, section) in index_data.items() if section != "1"]
 
-    opened_pdfs = []
+    opened_pdfs: list[Pdf] = []
     try:
         for filename in non_section_breaks:
             src_pdf, pages = get_pages(input_files, filename)
@@ -1637,7 +1637,7 @@ def _process_index_and_merge(bundle_config: BundleConfig, index_file, temp_path:
         bundle_logger.debug(f"[CB]Calling load_index_data [LI] with index_file: {index_file}")
         index_data = load_index_data(index_file, bundle_config)
     else:
-        index_data = None
+        index_data = {}
         bundle_logger.info("[CB]No index data provided.")
 
     # Merge PDFs using provided unique filenames
@@ -1649,7 +1649,7 @@ def _process_index_and_merge(bundle_config: BundleConfig, index_file, temp_path:
         ....index_data: {index_data}"""
     dedent_and_log(bundle_logger, log_msg)
     try:
-        toc_entries = merge_pdfs_create_toc_entries(input_files, merged_file, index_data, bundle_config)
+        toc_entries = merge_pdfs_create_toc_entries(input_files, merged_file, index_data)
     except Exception:
         bundle_logger.exception("[CB]Error while merging pdf files")
         raise
