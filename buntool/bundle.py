@@ -1164,7 +1164,7 @@ def _get_tex_page_numbering_text(config: FooterTexConfig, footer_text_prefix):
     return footer_text_prefix + r"Page \thepage"  # Default
 
 
-def generate_footer_pages_tex(  # noqa: PLR0915
+def generate_footer_pages_tex(
     page_numbers_tex_path,
     config: FooterTexConfig,
 ):
@@ -1270,7 +1270,7 @@ def pdf_paginator_reportlab(input_file, bundle_config: BundleConfig, output_file
     generate_footer_pages_reportlab(page_numbers_pdf_path, main_page_count, bundle_config)
     if Path(page_numbers_pdf_path).exists():
         try:
-            add_footer_to_bundle(input_file, page_numbers_pdf_path, output_file)  # type: ignore
+            add_footer_to_bundle(input_file, page_numbers_pdf_path, output_file)
             bundle_logger.debug("[PPRL]Page numbers overlaid on main PDF")
         except Exception:
             bundle_logger.exception("[PPRL]Error overlaying page numbers")

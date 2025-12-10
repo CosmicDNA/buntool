@@ -4,6 +4,7 @@ from docx import Document
 from docx.document import Document as DocumentObject
 from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.shared import Pt, RGBColor
+from docx.styles.style import CharacterStyle
 
 
 @dataclass
@@ -17,17 +18,16 @@ class DocxConfig:
 
 def _setup_document_style(doc: DocumentObject, index_font_setting):
     style = doc.styles['Normal']
-    #parse font setting same as in bundle.py:
-    # if font =
-    # style.font.name = 'Times New Roman'
-    if index_font_setting == "sans":
-        style.font.name = "Arial"  # type: ignore
-    elif index_font_setting == "serif":
-        style.font.name = "Times New Roman"  # type: ignore
-    elif index_font_setting == "mono":
-        style.font.name = "Courier New"  # type: ignore
-    else:
-        style.font.name = "Times New Roman"  # type: ignore
+    if isinstance(style, CharacterStyle):
+        font_name = "Times New Roman"
+        if index_font_setting == "sans":
+            font_name = "Arial"
+        elif index_font_setting == "serif":
+            font_name = "Times New Roman"
+        elif index_font_setting == "mono":
+            font_name = "Courier New"
+
+        style.font.name = font_name
 
 
 def _add_docx_header(doc: DocumentObject, casedetails: list[str], confidential):
