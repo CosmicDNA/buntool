@@ -7,7 +7,7 @@ Automatically make court bundles in seconds.  Check out the main instance: [bunt
 
 Takes input PDF files; generates index data; outputs a merged PDF with index, hyperlinks, bookmarks and page numbers according to your chosen settings.
 
-Output Bundles comply with the requirements of the English Courts, and are also useful for a range of other applications. 
+Output Bundles comply with the requirements of the English Courts, and are also useful for a range of other applications.
 
 # Usage and installation
 
@@ -22,23 +22,14 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # 3. Install the required packages
-pip install -r requirements.txt
-```
-## Copy fonts to fonts directory
-
-Buntool uses the font Charter, a popular style of font for legal documents. The four `.ttf` files need to be added to ReportLab's fonts folder:
-
-```bash
-# This command copies the fonts into your virtual environment.
-# The python* wildcard makes it work for any version of Python 3 
-cp static/Charter*.ttf ./venv/lib/python*/site-packages/reportlab/fonts/
+pip install -e .
 ```
 
 ## Ready to bake
 
 Now you can start the server:
 ```bash
-python app.py
+buntool
 ```
 Then visit `http://127.0.0.1:7001` in your browser.
 
