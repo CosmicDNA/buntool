@@ -2473,7 +2473,6 @@ def main():
     output_file = secure_filename(args.output_file) if args.output_file else secure_filename(f"{args.bundlename}-{timestamp}.pdf")
     coversheet = args.coversheet
     index_file = args.index
-    casedetails = [args.bundlename, args.claimno, args.casename]
     csv_index = args.csv_index
     confidential_bool = args.confidential
     zip_bool = args.zip if args.zip else False
@@ -2481,7 +2480,7 @@ def main():
     bundle_config = BundleConfig(
         BundleConfigParams(
             timestamp=timestamp,
-            case_details={"bundle_title": casedetails[0], "claim_no": casedetails[1], "case_name": casedetails[2]},
+            case_details={"bundle_title": args.bundlename, "claim_no": args.claimno, "case_name": args.casename},
             csv_string=csv_index,
             confidential_bool=confidential_bool,
             zip_bool=zip_bool,
