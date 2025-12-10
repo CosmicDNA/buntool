@@ -48,6 +48,7 @@ from typing import NamedTuple
 import pdfplumber
 import reportlab.rl_config
 from colorlog import ColoredFormatter
+from pdfplumber.pdf import PDF
 from pikepdf import OutlineItem, Pdf
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link
@@ -90,6 +91,7 @@ PAGE_WIDTH = defaultPageSize[0]  # reportlab page sizes used in more than one fu
 MIN_CSV_COLUMNS_WITH_SECTION = 4
 MIN_CSV_COLUMNS_NO_SECTION = 3
 MAX_TITLE_LENGTH_FOR_HYPERLINK_SEARCH = 30
+MIN_TOC_ENTRY_FIELDS = 3
 
 bundle_logger = logging.getLogger("bundle_logger")
 
@@ -1474,6 +1476,30 @@ class AddHyperlinksParams(NamedTuple):
     date_setting: str = "show_date"
     roman_page_labels: bool = False
 
+def get_scraped_pages_text(pdf: PDF, idx: int):
+    current_page = pdf.pages[idx]
+    bundle_logger.debug(f"[HYP]..Processing page {idx} for TOC text extraction")
+    return current_page.extract_text_lines()
+
+def _find_match_for_entry(entry, scraped_pages_text, length_of_coversheet, length_of_frontmatter):
+    """Find the first matching line in the scraped text for a given TOC entry."""
+    tab_to_find = str(entry[0])
+    bundle_logger.debug(f"[HYP]....Searching for tab: '{tab_to_find}'")
+    for page_idx, page_lines in enumerate(scraped_pages_text, start=length_of_coversheet):
+        if not page_lines:
+            continue
+        for line in page_lines:
+            line_text = str(line.get("text", ""))
+            if line_text.strip().startswith(tab_to_find):
+                bundle_logger.debug(f"[HYP]......SUCCESS: Found tab '{tab_to_find}' on page {page_idx} in line: '{line_text}'")
+                return {
+                    'title': entry[1],
+                    'toc_page': page_idx,
+                    'coords': (line['x0'], line['bottom'], line['x1'], line['top']),
+                    'destination_page': int(entry[3]) + length_of_frontmatter
+                }
+    bundle_logger.warning(f"[HYP]......FAILURE: No match found for tab '{tab_to_find}'")
+    return None
 
 def add_hyperlinks(
         pdf_file,
@@ -1498,45 +1524,17 @@ def add_hyperlinks(
     - pass off to the annotation writer for actual writing.
     """
     bundle_logger.debug("[HYP]Starting hyperlink addition")
-    scraped_pages_text = []
-    list_of_annotation_coords = []
 
     # Step 1: Extract text and coordinates from TOC
     with pdfplumber.open(pdf_file) as pdf:
-        for idx in range(length_of_coversheet, length_of_frontmatter):
-            current_page = pdf.pages[idx]
-            bundle_logger.debug(f"[HYP]..Processing page {idx} for TOC text extraction")
-            scraped_toc_text = current_page.extract_text_lines()
-            scraped_pages_text.append(scraped_toc_text)
+        scraped_pages_text = [get_scraped_pages_text(pdf, idx) for idx in range(length_of_coversheet, length_of_frontmatter)]
 
-    # Step 2: Match TOC entries to text and get coordinates
-    for entry in toc_entries:
-        bundle_logger.debug(f"[HYP]..Processing TOC entry: {entry}")
-
-        # Skip section breaks and header rows
-        if "SECTION_BREAK" in entry[0] or (len(entry) > 3 and str(entry[3]) == "Page"):
-            continue
-
-        tab_to_find = str(entry[0])
-        found_match = False
-        bundle_logger.debug(f"[HYP]....Searching for tab: '{tab_to_find}'")
-
-        for page_idx, page_words in enumerate(scraped_pages_text, start=length_of_coversheet):
-            for line in page_words:
-                line_text = str(line.get("text", ""))
-                if line_text.strip().startswith(tab_to_find):
-                    bundle_logger.debug(f"[HYP]......SUCCESS: Found tab '{tab_to_find}' on page {page_idx} in line: '{line_text}'")
-                    annotation = {
-                        'title': entry[1],  # title of the TOC entry
-                        'toc_page': page_idx,  # 0-based index for TOC page
-                        'coords': (line['x0'], line['bottom'], line['x1'], line['top']),
-                        'destination_page': int(entry[3]) + length_of_frontmatter
-                    }
-                    list_of_annotation_coords.append(annotation)
-                    found_match = True
-                    break
-            if found_match:
-                break
+    list_of_annotation_coords = [
+        match
+        for entry in toc_entries
+        if "SECTION_BREAK" not in entry[0] and not (len(entry) > MIN_TOC_ENTRY_FIELDS and str(entry[3]) == "Page")
+        if (match := _find_match_for_entry(entry, scraped_pages_text, length_of_coversheet, length_of_frontmatter))
+    ]
 
     # Step 3: Add annotations to the PDF
     add_annotations_with_transform(pdf_file, list_of_annotation_coords, output_file)
