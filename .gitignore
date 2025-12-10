@@ -23,3 +23,5 @@ memory-bank/
 # macOS
 .DS_Store
 buntool.egg-info/
+
+dist/

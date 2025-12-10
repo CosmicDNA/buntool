@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["setuptools>=61.0", "wheel", "nuitka", "toml"]
+build-backend = "nuitka.distutils.Build"
 
 [project]
 name = "buntool"
@@ -84,3 +84,6 @@ buntool = "buntool.app:main"
 [tool.setuptools]
 packages = ["buntool"]
 include-package-data = true
+
+[tool.setuptools.package-data]
+"buntool" = ["static/**"]
