@@ -50,6 +50,7 @@ import reportlab.rl_config
 from colorlog import ColoredFormatter
 from pdfplumber.pdf import PDF
 from pikepdf import OutlineItem, Pdf
+from pikepdf._core import Page
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link
 from pypdf.generic import DictionaryObject as Dictionary
@@ -372,6 +373,15 @@ def _generate_toc_entry(toc_entry_params: TocEntryParams):
     else:
         return (tab_number, entry_title, entry_date, current_page_start)
 
+def get_pages(input_files, filename) -> tuple[Pdf, list[Page]] | tuple[None, list]:
+    this_file_path = next((path for path in input_files if path.name == Path(filename).name), None)
+    if this_file_path and this_file_path.exists():
+        try:
+            src = Pdf.open(this_file_path)
+            return src, src.pages[:]
+        except Exception:
+            bundle_logger.exception(f"Error merging file {this_file_path}")
+    return None, []
 
 def merge_pdfs_create_toc_entries(input_files, output_file, index_data, bundle_config):
     """Merge PDFs and create table of contents entries.
@@ -401,20 +411,24 @@ def merge_pdfs_create_toc_entries(input_files, output_file, index_data, bundle_c
     ]
 
     # Now, merge the PDFs in the correct order
-    for filename, (_, _, section) in index_data.items():
-        if section == "1":
-            continue  # Skip section breaks for merging
+    non_section_breaks = [filename for filename, (_, _, section) in index_data.items() if section != "1"]
 
-        this_file_path = next((path for path in input_files if path.name == Path(filename).name), None)
-        if this_file_path and this_file_path.exists():
-            try:
-                with Pdf.open(this_file_path) as src:
-                    pdf.pages.extend(src.pages)
-            except Exception:
-                bundle_logger.exception(f"Error merging file {this_file_path}")
+    opened_pdfs = []
+    try:
+        for filename in non_section_breaks:
+            src_pdf, pages = get_pages(input_files, filename)
+            if src_pdf:
+                opened_pdfs.append(src_pdf)
+                pdf.pages.extend(pages)
+            else:
+                bundle_logger.warning(f"Could not get pages from {filename}. Skipping.")
 
-    pdf.save(output_file)
-    return toc_entries
+        pdf.save(output_file)
+        return toc_entries
+    finally:
+        # Ensure all source PDFs are closed after we are done with their pages
+        for src in opened_pdfs:
+            src.close()
 
 
 def _create_bookmark_item(entry, length_of_frontmatter, bundle_config: BundleConfig):
@@ -1606,9 +1620,8 @@ def _initialize_bundle_creation(bundle_config_data: BundleConfig, output_file, c
     dedent_and_log(bundle_logger, debug_log_msg)
 
     initial_temp_files = [f for f in (coversheet_path, index_file) if f]
-    initial_temp_files.extend(input_files)
 
-    return bundle_config, temp_path, tmp_output_file, coversheet_path, initial_temp_files
+    return bundle_config, temp_path, tmp_output_file, coversheet_path, initial_temp_files + input_files
 
 
 def _process_index_and_merge(bundle_config: BundleConfig, index_file, temp_path: Path, input_files):
