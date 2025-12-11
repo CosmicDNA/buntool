@@ -319,7 +319,7 @@ def create_bundle():
         t2 = datetime.now()
 
         delta = t2 - t1
-        current_app.logger.info(f"Bundle creation completed in {delta} seconds for session ID: {session_id}")
+        current_app.logger.info(f"Bundle creation completed in {delta} for session ID: {session_id}")
 
         return _build_and_respond(received_output_file, zip_file_path, session_id)
 
