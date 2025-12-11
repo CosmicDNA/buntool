@@ -70,7 +70,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # 3. Install wheel where * is the name of the created wheel
-pip install ../dist/*.whl
+pip install ../buntool/dist/*.whl
 
 # 4. Run application
 buntool
