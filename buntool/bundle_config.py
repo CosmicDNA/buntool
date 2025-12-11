@@ -26,6 +26,7 @@ class BundleConfigParams(NamedTuple):
     logs_dir: Path | None = None
     bookmark_setting: str = "uk_abbreviated"
 
+
 @dataclass(init=False)
 class BundleConfig:
     def __init__(

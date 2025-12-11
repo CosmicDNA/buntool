@@ -17,7 +17,7 @@ class DocxConfig:
 
 
 def _setup_document_style(doc: DocumentObject, index_font_setting):
-    style = doc.styles['Normal']
+    style = doc.styles["Normal"]
     if isinstance(style, CharacterStyle):
         font_name = "Times New Roman"
         if index_font_setting == "sans":
@@ -62,9 +62,9 @@ def _add_docx_header(doc: DocumentObject, casedetails: list[str], confidential):
 
 
 def _create_and_populate_table(doc: DocumentObject, toc_entries, date_setting):
-# Table of Contents header row
+    # Table of Contents header row
     table = doc.add_table(rows=1, cols=4)
-    table.style = 'Table Grid'
+    table.style = "Table Grid"
 
     header_cells = table.rows[0].cells
     header_cells[0].text = "Tab"
@@ -94,7 +94,7 @@ def _create_and_populate_table(doc: DocumentObject, toc_entries, date_setting):
         else:
             # Add a regular TOC entry
             row[0].text = str(entry[0])  # Tab
-            row[1].text = entry[1]      # Title
+            row[1].text = entry[1]  # Title
             row[2].text = entry[2] if date_setting else ""  # Date
             row[3].text = str(entry[3])  # Page
 
@@ -110,6 +110,7 @@ def create_toc_docx(toc_entries, casedetails: list[str], output_file_path, confi
     # Save the document
     doc.save(output_file_path)
 
+
 # main
 if __name__ == "__main__":
     # Sample data
@@ -117,7 +118,7 @@ if __name__ == "__main__":
         ("001.", "First Doc", "2021-01-01", 1),
         ("002", "Second Doc", "2021-01-02", 5),
         ("003", "Third Document", "2021-01-03", 10),
-        #("SECTION_BREAK", "Section Break Test", "", ""),
+        # ("SECTION_BREAK", "Section Break Test", "", ""),
         ("004", "Document Number Four", "2021-01-04", 15),
         ("005", "The fifth document in this series", "2021-01-05", 20),
     ]
