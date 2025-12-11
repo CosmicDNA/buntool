@@ -1714,9 +1714,7 @@ def _create_front_matter(bundle_config, coversheet, coversheet_path, temp_path: 
         try:
             dummy_toc_pdf_path = temp_path / "TEMP02_dummy_toc.pdf"
             options = {"confidential": bundle_config.confidential_bool, "date_setting": bundle_config.date_setting, "dummy": True}
-            create_toc_pdf_reportlab(  # DUMMY TOC)
-                toc_entries, bundle_config.case_details, bundle_config, dummy_toc_pdf_path, options
-            )
+            create_toc_pdf_reportlab(toc_entries, bundle_config.case_details, bundle_config, dummy_toc_pdf_path, options)  # DUMMY TOC)
         except Exception:
             bundle_logger.exception("[CB]Error during first pass TOC creation")
             raise
@@ -1851,23 +1849,28 @@ def create_toc_pdf_tex(toc_entries, casedetails, output_file, config: TocTexConf
 \geometry{a4paper, hmargin=2.5cm,vmargin=2cm}
 \definecolor{Gray}{gray}{0.9}
 """,
-        get_non_roman_pagestyle()
-        if not config.roman_numbering
-        else r"""
+        (
+            get_non_roman_pagestyle()
+            if not config.roman_numbering
+            else r"""
 \begin{document}
 \pagestyle{empty}
-""",
+"""
+        ),
         rf"\fontfamily{{{index_font_family}}}\selectfont" if index_font_family else "",
         rf"\hfill\textbf{{\normalsize{{{claimno_hdr}}}}} \\" if claimno_hdr else "",
         r"\vspace{{-0.5cm}}" if claimno_hdr else "",
-        rf"""
+        (
+            rf"""
 \begin{{center}}
 \textbf{{\large{{{casename}}}}} \\
 \end{{center}}
 """
-        if casename
-        else "",
-        rf"""
+            if casename
+            else ""
+        ),
+        (
+            rf"""
 \begin{{center}}
 \rule{{0.5\linewidth}}{{0.3mm}} \\
 \vspace{{0.3cm}}
@@ -1876,8 +1879,9 @@ def create_toc_pdf_tex(toc_entries, casedetails, output_file, config: TocTexConf
 \vspace{{-0.5cm}}
 \end{{center}}
 """
-        if bundle_name
-        else "",
+            if bundle_name
+            else ""
+        ),
         rf"""
 \def\arraystretch{{1.3}}
 \begin{{longtable}}{{p{{1.2cm}} p{{10cm}} p{{{date_col_width}}} r}}
@@ -1896,13 +1900,15 @@ def create_toc_pdf_tex(toc_entries, casedetails, output_file, config: TocTexConf
 """,
         "".join(
             [
-                r"\hline \rowcolor{Gray}\multicolumn{4}{l}{\textbf{" + entry[1] + r"}} \\ \hline "
-                if "SECTION_BREAK" in entry[0]
-                else (
-                    f"{sanitise_latex(entry[0])} & "
-                    f"{sanitise_latex(entry[1])} & "
-                    f"{'' if config.date_setting == 'hide_date' else sanitise_latex(entry[2])} & "
-                    f"{999 if config.dummy else entry[3] + page_offset} \\\\"
+                (
+                    r"\hline \rowcolor{Gray}\multicolumn{4}{l}{\textbf{" + entry[1] + r"}} \\ \hline "
+                    if "SECTION_BREAK" in entry[0]
+                    else (
+                        f"{sanitise_latex(entry[0])} & "
+                        f"{sanitise_latex(entry[1])} & "
+                        f"{'' if config.date_setting == 'hide_date' else sanitise_latex(entry[2])} & "
+                        f"{999 if config.dummy else entry[3] + page_offset} \\\\"
+                    )
                 )
                 for entry in toc_entries
             ]

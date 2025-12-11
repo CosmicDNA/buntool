@@ -38,6 +38,7 @@ dev = [
     "buntool[test]", # Includes all dependencies from the 'test' group,
     "pre-commit", # For managing pre-commit hooks
     "ruff",
+    "black",
 ]
 
 [tool.ruff]
