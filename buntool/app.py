@@ -245,7 +245,8 @@ def create_bundle():
     if request.method == 'GET':
         return render_template('index.html')
 
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    t1 = datetime.now()
+    timestamp = t1.strftime('%Y%m%d_%H%M%S')
     session_id = str(uuid.uuid4())[:8]
     user_agent = request.headers.get('User-Agent') or ""
     current_app.logger.debug("******************APP HEARS A CALL******************")
@@ -311,9 +312,14 @@ def create_bundle():
             ....bundle_config elements: {bundle_config.__dict__}"""
         current_app.logger.info(textwrap.dedent(log_msg))
 
+
         received_output_file, zip_file_path = bundle.create_bundle(
             input_files, output_file, secure_coversheet_filename, sanitised_filenames_index_csv, bundle_config
         )
+        t2 = datetime.now()
+
+        delta = t2 - t1
+        current_app.logger.info(f"Bundle creation completed in {delta} seconds for session ID: {session_id}")
 
         return _build_and_respond(received_output_file, zip_file_path, session_id)
 
@@ -355,6 +361,7 @@ def create_app():
     app = Flask(__name__)
     app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # file size limit in MB
     app.logger.setLevel(logging.DEBUG)
+    app.logger.propagate = False # Prevent duplicate logging if root logger also has handlers
 
     # Apply color formatter to the default console handler
     for handler in app.logger.handlers:

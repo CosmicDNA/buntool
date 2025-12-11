@@ -33,6 +33,50 @@ buntool
 ```
 Then visit `http://127.0.0.1:7001` in your browser.
 
+# Packaging as Nuitka compiled wheel for 15% speed up
+In our local tests we noticed a 15% speed up when compiling the wheel with Nuitka so we decided to include instructions on how to integrate Nuitka in your workflow.
+
+## Building the compiled wheel
+In the project folder:
+
+```bash
+# 1. Create the virtual environment (a hidden folder named .venv)
+python3 -m venv .venv
+
+# 2. Activate the virtual environment
+source .venv/bin/activate
+
+# 3. Install the required packages
+pip install .[build]
+
+# 4. Build wheel
+python -m build
+```
+
+This will create a .whl file within the dist folder.
+
+## Install wheel in a new venv and run
+To make sure you run on an isolated from build environment, deactivate the previous venv and create a new sibling folder with a new venv:
+
+```bash
+deactivate
+cd ..
+mkdir new-folder && cd new-folder
+
+# 1. Create the virtual environment (a hidden folder named .venv)
+python3 -m venv .venv
+
+# 2. Activate the virtual environment
+source .venv/bin/activate
+
+# 3. Install wheel where * is the name of the created wheel
+pip install ../dist/*.whl
+
+# 4. Run application
+buntool
+```
+
+
 # Copyright and License
 
 Copyright © Tristan Sherliker and contributors to BunTool

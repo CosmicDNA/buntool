@@ -27,12 +27,16 @@ test = [
     "pytest"
 ]
 
-dev = [
-    "buntool[test]", # Includes all dependencies from the 'test' group,
-    "pre-commit", # For managing pre-commit hooks
+build = [
     "build",
     "bump-my-version",
     "twine",
+]
+
+dev = [
+    "buntool[build]", # Includes all dependencies from the 'build' group,
+    "buntool[test]", # Includes all dependencies from the 'test' group,
+    "pre-commit", # For managing pre-commit hooks
     "ruff",
 ]
 
