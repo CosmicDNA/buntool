@@ -385,6 +385,40 @@ def get_pages(input_files, filename) -> tuple[Pdf, list[Page]] | tuple[None, lis
     return None, []
 
 
+def get_links(path: Path):
+    reader = PdfReader(path)
+    if reader.pages:  # Check if there are any pages
+        for page in reader.pages:
+            if page.annotations:  # Check if annotations exist for the page
+                for annotation in page.annotations:
+                    obj = annotation.get_object()
+                    if obj and obj.get("/Subtype") == "/Link":  # Check if obj is not None before calling .get()
+                        bundle_logger.info(f"Link : {obj.get('/A').get('/URI')}")
+
+
+def get_bookmarks(path: Path):
+    """Reads a PDF and logs its bookmarks (outline)."""
+    try:
+        reader = PdfReader(path)
+        if not reader.outline:
+            bundle_logger.info(f"No bookmarks found in {path.name}")
+            return
+
+        def _traverse_outline(items, level=0):
+            """Recursively traverse and log outline items."""
+            for item in items:
+                if isinstance(item, list):
+                    _traverse_outline(item, level + 1)
+                else:
+                    # Use get_destination_page_number for robustness
+                    page_num = reader.get_destination_page_number(item)
+                    bundle_logger.info(f"{'  ' * level}Bookmark: '{item.title}' -> Page {page_num}")
+
+        _traverse_outline(reader.outline)
+    except Exception:
+        bundle_logger.exception(f"Error reading bookmarks from {path.name}")
+
+
 def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
     """Merge PDFs and create table of contents entries.
 
@@ -420,6 +454,11 @@ def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
         for filename in non_section_breaks:
             src_pdf, pages = get_pages(input_files, filename)
             if src_pdf:
+                this_file_path = next((path for path in input_files if path.name == Path(filename).name), None)
+                # bundle_logger.debug(f"Merging {filename} with {len(pages)} pages.")
+                if this_file_path:
+                    # get_links(this_file_path)
+                    get_bookmarks(this_file_path)
                 opened_pdfs.append(src_pdf)
                 pdf.pages.extend(pages)
             else:
