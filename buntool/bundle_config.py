@@ -2,7 +2,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 
 class BundleConfigParams(NamedTuple):
@@ -25,6 +25,7 @@ class BundleConfigParams(NamedTuple):
     temp_dir: Path | None = None
     logs_dir: Path | None = None
     bookmark_setting: str = "uk_abbreviated"
+    all_sub_bookmarks: list[dict[str, Any]] | None = None
 
 
 @dataclass(init=False)
@@ -33,25 +34,28 @@ class BundleConfig:
         self,
         bundle_config_params: BundleConfigParams,
     ):
-        timestamp = bundle_config_params.timestamp
-        case_details = bundle_config_params.case_details
-        csv_string = bundle_config_params.csv_string
-        confidential_bool = bundle_config_params.confidential_bool
-        zip_bool = bundle_config_params.zip_bool
-        session_id = bundle_config_params.session_id
-        user_agent = bundle_config_params.user_agent
-        page_num_align = bundle_config_params.page_num_align
-        index_font = bundle_config_params.index_font
-        footer_font = bundle_config_params.footer_font
-        page_num_style = bundle_config_params.page_num_style
-        footer_prefix = bundle_config_params.footer_prefix
-        date_setting = bundle_config_params.date_setting
-        roman_for_preface = bundle_config_params.roman_for_preface
-        expected_length_of_frontmatter = bundle_config_params.expected_length_of_frontmatter
-        main_page_count = bundle_config_params.main_page_count
-        temp_dir = bundle_config_params.temp_dir
-        logs_dir = bundle_config_params.logs_dir
-        bookmark_setting = bundle_config_params.bookmark_setting
+        (
+            timestamp,
+            case_details,
+            csv_string,
+            confidential_bool,
+            zip_bool,
+            session_id,
+            user_agent,
+            page_num_align,
+            index_font,
+            footer_font,
+            page_num_style,
+            footer_prefix,
+            date_setting,
+            roman_for_preface,
+            expected_length_of_frontmatter,
+            main_page_count,
+            temp_dir,
+            logs_dir,
+            bookmark_setting,
+            all_sub_bookmarks,
+        ) = bundle_config_params
 
         self.timestamp = timestamp or datetime.now().strftime("%Y-%m-%d-%H%M%S")
         self.case_details = case_details
@@ -74,3 +78,4 @@ class BundleConfig:
         self.temp_dir = temp_dir if temp_dir else Path(base_temp) / "buntool" / "tempfiles" / self.session_id
         self.logs_dir = logs_dir if logs_dir else Path(base_temp) / "buntool" / "logs" / self.session_id
         self.bookmark_setting = bookmark_setting if bookmark_setting else "uk_abbreviated"
+        self.all_sub_bookmarks = all_sub_bookmarks if all_sub_bookmarks is not None else []
