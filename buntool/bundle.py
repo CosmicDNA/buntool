@@ -49,13 +49,11 @@ import pdfplumber
 import reportlab.rl_config
 from colorlog import ColoredFormatter
 from pdfplumber.pdf import PDF
-from pikepdf import Name as PikeName
 from pikepdf import OutlineItem, Pdf
 from pikepdf._core import Page
 from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link
 from pypdf.generic import DictionaryObject as Dictionary
-from pypdf.generic import Fit
 from pypdf.generic import NameObject as Name
 
 # reportlab stuff
@@ -583,7 +581,7 @@ def add_bookmarks_to_pdf(pdf_file, output_file, toc_entries, length_of_frontmatt
                     if parent_bookmark:
                         for title, page_num, _ in bookmarks_to_add:
                             final_page_num = page_num + length_of_frontmatter
-                            parent_bookmark.children.append(OutlineItem(title, [final_page_num, PikeName("/Fit")]))  # type: ignore
+                            parent_bookmark.children.append(OutlineItem(title, final_page_num))
 
         pdf.save(output_file)
 
@@ -617,12 +615,12 @@ def bookmark_the_index(pdf_file, output_file, coversheet=None):
                 with Pdf.open(coversheet) as coversheet_pdf:
                     coversheet_length = len(coversheet_pdf.pages)
                 # Add an outline item for "Index" linking to the first page after the coversheet (it's 0-indexed):
-                index_item = OutlineItem("Index", [coversheet_length, PikeName("/Fit")])  # type: ignore
+                index_item = OutlineItem("Index", coversheet_length)
                 outline.root.insert(0, index_item)
                 bundle_logger.debug("[BTI]coversheet is specified, outline item added for index")
             else:
                 # Add an outline item for "Index" linking to the first page:
-                index_item = OutlineItem("Index", [0, PikeName("/Fit")])  # type: ignore
+                index_item = OutlineItem("Index", 0)
                 outline.root.insert(0, index_item)
                 bundle_logger.debug("[BTI]no coversheet specified, outline item added for index")
         pdf.save(output_file)
@@ -1497,7 +1495,7 @@ def add_annotations_with_transform(pdf_file, list_of_annotation_coords, output_f
 
         try:
             # Create link annotation with transformed coordinates
-            link = Link(rect=transformed_coords, target_page_index=destination_page, fit=Fit("/FitH"))
+            link = Link(rect=transformed_coords, target_page_index=destination_page)
             writer.add_annotation(page_number=toc_page, annotation=link)
 
             # # Create highlight annotation with transformed coordinates
