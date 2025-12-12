@@ -385,15 +385,33 @@ def get_pages(input_files, filename) -> tuple[Pdf, list[Page]] | tuple[None, lis
     return None, []
 
 
-def get_links(path: Path):
-    reader = PdfReader(path)
-    if reader.pages:  # Check if there are any pages
-        for page in reader.pages:
-            if page.annotations:  # Check if annotations exist for the page
-                for annotation in page.annotations:
-                    obj = annotation.get_object()
-                    if obj and obj.get("/Subtype") == "/Link":  # Check if obj is not None before calling .get()
-                        bundle_logger.info(f"Link : {obj.get('/A').get('/URI')}")
+def get_and_adjust_bookmarks(path: Path, page_offset: int) -> list[tuple[str, int, int]]:
+    """Reads a PDF's bookmarks, adjusts their page destinations by an offset.
+
+    And returns them as a list of (title, page_number, level) tuples.
+    """
+    adjusted_bookmarks = []
+    try:
+        reader = PdfReader(path)
+        if not reader.outline:
+            return []
+
+        def _traverse_and_adjust(items, level=0):
+            """Recursively traverse, adjust, and collect outline items as tuples."""
+            for item in items:
+                if isinstance(item, list):
+                    _traverse_and_adjust(item, level + 1)
+                else:
+                    page_num = reader.get_destination_page_number(item)
+                    if page_num is not None:
+                        new_page_num = page_num + page_offset
+                        adjusted_bookmarks.append((item.title, new_page_num, level))
+
+        _traverse_and_adjust(reader.outline)
+        bundle_logger.info(f"Found and adjusted {len(adjusted_bookmarks)} bookmarks in {path.name}")
+    except Exception:
+        bundle_logger.exception(f"Error reading and adjusting bookmarks from {path.name}")
+    return adjusted_bookmarks
 
 
 def get_bookmarks(path: Path):
@@ -410,6 +428,7 @@ def get_bookmarks(path: Path):
                 if isinstance(item, list):
                     _traverse_outline(item, level + 1)
                 else:
+                    # item.get("/Page")
                     # Use get_destination_page_number for robustness
                     page_num = reader.get_destination_page_number(item)
                     bundle_logger.info(f"{'  ' * level}Bookmark: '{item.title}' -> Page {page_num}")
@@ -450,19 +469,36 @@ def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
     non_section_breaks = [filename for filename, (_, _, section) in index_data.items() if section != "1"]
 
     opened_pdfs: list[Pdf] = []
+    all_sub_bookmarks: list[tuple[str, int, int]] = []
+    current_page_offset = 0
     try:
         for filename in non_section_breaks:
             src_pdf, pages = get_pages(input_files, filename)
             if src_pdf:
                 this_file_path = next((path for path in input_files if path.name == Path(filename).name), None)
-                # bundle_logger.debug(f"Merging {filename} with {len(pages)} pages.")
                 if this_file_path:
-                    # get_links(this_file_path)
-                    get_bookmarks(this_file_path)
+                    sub_bookmarks = get_and_adjust_bookmarks(this_file_path, current_page_offset)
+                    if sub_bookmarks:
+                        all_sub_bookmarks.extend(sub_bookmarks)
                 opened_pdfs.append(src_pdf)
                 pdf.pages.extend(pages)
+                current_page_offset += len(pages)
             else:
                 bundle_logger.warning(f"Could not get pages from {filename}. Skipping.")
+
+        with pdf.open_outline() as outline:
+            # Recreate OutlineItems within the context of the destination PDF
+            # This is a simplified approach for flat bookmarks.
+            # A more complex solution is needed for nested bookmarks.
+            parent_outlines = [outline.root]
+            for title, page_num, level in all_sub_bookmarks:
+                # Ensure parent_outlines has enough items for the current level
+                while level >= len(parent_outlines):
+                    # This might not always be correct for complex structures,
+                    # but works for simple nesting.
+                    parent_outlines.append(parent_outlines[-1][-1].children)
+
+                parent_outlines[level].append(OutlineItem(title, page_num))
 
         pdf.save(output_file)
         return toc_entries
