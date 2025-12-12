@@ -26,3 +26,5 @@ buntool.egg-info/
 
 dist/
 build/
+
+*.log

@@ -49,6 +49,7 @@ import pdfplumber
 import reportlab.rl_config
 from colorlog import ColoredFormatter
 from pdfplumber.pdf import PDF
+from pikepdf import Name as PikeName
 from pikepdf import OutlineItem, Pdf
 from pikepdf._core import Page
 from pypdf import PdfReader, PdfWriter
@@ -404,9 +405,6 @@ def get_and_adjust_bookmarks(path: Path, page_offset: int) -> list[tuple[str, in
                 if isinstance(item, list):
                     _traverse_and_adjust(item, level + 1)
                 else:
-                    if item.title == "Index":
-                        bundle_logger.debug("  - Skipping redundant 'Index' bookmark.")
-                        continue  # Skip the redundant 'Index' bookmark from sub-bundles.
                     page_num = reader.get_destination_page_number(item)
                     if page_num is not None:
                         new_page_num = page_num + page_offset
@@ -585,7 +583,7 @@ def add_bookmarks_to_pdf(pdf_file, output_file, toc_entries, length_of_frontmatt
                     if parent_bookmark:
                         for title, page_num, _ in bookmarks_to_add:
                             final_page_num = page_num + length_of_frontmatter
-                            parent_bookmark.children.append(OutlineItem(title, final_page_num))
+                            parent_bookmark.children.append(OutlineItem(title, [final_page_num, PikeName("/Fit")]))  # type: ignore
 
         pdf.save(output_file)
 
@@ -619,12 +617,12 @@ def bookmark_the_index(pdf_file, output_file, coversheet=None):
                 with Pdf.open(coversheet) as coversheet_pdf:
                     coversheet_length = len(coversheet_pdf.pages)
                 # Add an outline item for "Index" linking to the first page after the coversheet (it's 0-indexed):
-                index_item = OutlineItem("Index", coversheet_length)
+                index_item = OutlineItem("Index", [coversheet_length, PikeName("/Fit")])  # type: ignore
                 outline.root.insert(0, index_item)
                 bundle_logger.debug("[BTI]coversheet is specified, outline item added for index")
             else:
                 # Add an outline item for "Index" linking to the first page:
-                index_item = OutlineItem("Index", 0)
+                index_item = OutlineItem("Index", [0, PikeName("/Fit")])  # type: ignore
                 outline.root.insert(0, index_item)
                 bundle_logger.debug("[BTI]no coversheet specified, outline item added for index")
         pdf.save(output_file)
