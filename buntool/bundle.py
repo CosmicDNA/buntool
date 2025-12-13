@@ -992,27 +992,25 @@ def reportlab_footer_config(canvas: Canvas, doc, bundle_config: BundleConfig):
 
     boldness = "bold"
 
+    options = ["serif", "sans", "mono", "traditional", "helvetica"]
+
+    regular = ["Times-Roman", "Helvetica", "Courier", "Charter_regular", "Helvetica"]
+    bold = ["Times-Bold", "Helvetica-Bold", "Courier-Bold", "Charter_bold", "Helvetica-Bold"]
+
     fonts = {
-        "regular": ["Times-Roman", "sans", "Courier", "Charter_regular", "Helvetica"],
-        "bold": ["Times-Bold", "Sans-Bold", "Courier-Bold", "Charter_bold", "Helvetica-Bold"],
+        "options": options,
+        "regular": regular,
+        "bold": bold,
     }
-
-    font_map = {
-        "Times-Roman": 0,
-        "sans": 1,
-        "Courier": 2,
-        "Charter_regular": 3,
-        "Helvetica": 4,
-    }
-
-    font_name = "Times-Roman"  # default]
-
-    footer_font = page_num_font
-    font_index = font_map[font_name]
 
     canvas.saveState()
+
     footer_base_font_size = 16
-    footer_font = fonts[boldness][font_index]
+    if page_num_font in fonts["options"]:
+        footer_font = fonts[boldness][options.index(page_num_font)]
+    else:
+        bundle_logger.warning(f"[MPNP]..Unsupported font {page_num_font} for page numbers, defaulting to Times-Roman")
+        footer_font = "Times-Roman"
     canvas.setFont(footer_font, footer_base_font_size)
 
     def _get_page_number_string(style, page_num, offset, total_pages):
