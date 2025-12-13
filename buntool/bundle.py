@@ -58,15 +58,15 @@ from pypdf.generic import NameObject as Name
 
 # reportlab stuff
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, StyleSheet1, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen.canvas import Canvas
 from reportlab.platypus import (
     Flowable,
-    Frame,
     PageBreak,
     Paragraph,
     SimpleDocTemplate,
@@ -976,7 +976,7 @@ def generate_footer_pages_reportlab(filename, num_pages, bundle_config):
     doc.build(story, onFirstPage=footer_config_with_bundle, onLaterPages=footer_config_with_bundle)
 
 
-def reportlab_footer_config(canvas, doc, bundle_config: BundleConfig):
+def reportlab_footer_config(canvas: Canvas, doc, bundle_config: BundleConfig):
     """Configure the footer for ReportLab documents.
 
     the other reportlab functions during their build process.
@@ -990,67 +990,37 @@ def reportlab_footer_config(canvas, doc, bundle_config: BundleConfig):
     page_numbering_style = bundle_config.page_num_style if bundle_config.page_num_style else None
     footer_prefix = bundle_config.footer_prefix if bundle_config.footer_prefix else ""
 
-    def set_footer_font_and_base(page_num_font):
-        if page_num_font == "serif":
-            footer_font = "Times-Roman"
-            footer_base_font_size = 15
-        elif page_num_font == "Helvetica":
-            footer_font = "sans"
-            footer_base_font_size = 14
-        elif page_num_font == "mono":
-            footer_font = "Courier"
-            footer_base_font_size = 14
-        elif page_num_font == "traditional":
-            footer_font = "Charter_regular"
-            footer_base_font_size = 15
-        else:  # defalt to Helvetica
-            footer_font = "Helvetica"
-            footer_base_font_size = 14
-        return footer_font, footer_base_font_size
+    boldness = "bold"
 
-    footer_font, footer_base_font_size = set_footer_font_and_base(page_num_font)
+    fonts = {
+        "regular": ["Times-Roman", "sans", "Courier", "Charter_regular", "Helvetica"],
+        "bold": ["Times-Bold", "Sans-Bold", "Courier-Bold", "Charter_bold", "Helvetica-Bold"],
+    }
+
+    font_map = {
+        "Times-Roman": 0,
+        "sans": 1,
+        "Courier": 2,
+        "Charter_regular": 3,
+        "Helvetica": 4,
+    }
+
+    font_name = "Times-Roman"  # default]
+
+    footer_font = page_num_font
+    font_index = font_map[font_name]
 
     canvas.saveState()
-    canvas.setFont("Times-Bold", 16)
-    if page_num_alignment == "left":
-        footer_style = ParagraphStyle(
-            "BodyText",
-            fontSize=footer_base_font_size,
-            fontName=footer_font,
-            # leading=14
-            alignment=TA_LEFT,
-        )
-    elif page_num_alignment == "right":
-        footer_style = ParagraphStyle(
-            "BodyText",
-            fontSize=footer_base_font_size,
-            fontName=footer_font,
-            # leading=14
-            alignment=TA_RIGHT,
-        )
-    elif page_num_alignment == "centre":
-        footer_style = ParagraphStyle(
-            "BodyText",
-            fontSize=footer_base_font_size,
-            fontName=footer_font,
-            # leading=14
-            alignment=TA_CENTER,
-        )
-    else:
-        footer_style = ParagraphStyle(
-            "BodyText",
-            fontSize=footer_base_font_size,
-            fontName=footer_font,
-            # leading=14
-            alignment=TA_RIGHT,
-        )
+    footer_base_font_size = 16
+    footer_font = fonts[boldness][font_index]
+    canvas.setFont(footer_font, footer_base_font_size)
 
     def _get_page_number_string(style, page_num, offset, total_pages):
         """Get formatted page number string based on style."""
         current_page = page_num + offset
 
         style_formats = {
-            "x": f"{current_page}",
+            "x": str(current_page),
             "x_of_y": f"{page_num} of {total_pages}",
             "page_x": f"Page {current_page}",
             "page_x_of_y": f"Page {current_page} of {total_pages}",
@@ -1064,20 +1034,33 @@ def reportlab_footer_config(canvas, doc, bundle_config: BundleConfig):
     # Build the complete footer data string in one assignment
     footer_data = f"{footer_prefix.strip()} {page_number_str}" if footer_prefix else page_number_str
 
-    footer_frame = Frame(
-        0,
-        0 * cm,  # x, y lower left
-        PAGE_WIDTH,
-        1.5 * cm,  # box width and height
-        leftPadding=50,
-        bottomPadding=0,
-        rightPadding=50,
-        topPadding=0,
-        id="footerframe",
-        showBoundary=0,
-    )
-    # footer_frame.hAlign = 'RIGHT' # hAlign is not a valid attribute for Frame
-    footer_frame.add(Paragraph(footer_data, footer_style), canvas)
+    # --- Text Stroke/Halo Implementation ---
+    canvas.setFont(footer_font, footer_base_font_size)
+    text_width = canvas.stringWidth(footer_data, footer_font, footer_base_font_size)
+
+    # Calculate x-coordinate based on alignment
+    if page_num_alignment == "right":
+        x = PAGE_WIDTH - 50 - text_width  # 50 is right margin
+    elif page_num_alignment == "centre":
+        x = (PAGE_WIDTH - text_width) / 2
+    else:  # Default to left
+        x = 50  # 50 is left margin
+
+    y = 1 * cm  # Position from bottom of the page
+
+    # Create a text object for the stroke effect
+    text_object = canvas.beginText()
+    text_object.setTextOrigin(x, y)
+    text_object.setFont(footer_font, footer_base_font_size)
+
+    # 1. Draw the "stroke" (a slightly thicker black outline)
+    text_object.setTextRenderMode(2)  # Stroke and Fill
+    text_object.setStrokeColor(colors.white, alpha=0.9)
+    canvas.setLineWidth(0.35)
+    text_object.setFillColor(colors.black, alpha=0.9)  # Transparent fill for stroke effect
+    text_object.textLine(footer_data)
+    canvas.drawText(text_object)
+    canvas.restoreState()
 
 
 def get_index_font_family(index_font):
