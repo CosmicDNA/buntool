@@ -39,7 +39,7 @@ dev = [
     "buntool[test]", # Includes all dependencies from the 'test' group,
     "pre-commit", # For managing pre-commit hooks
     "ruff",
-    "black",
+    "vulture"
 ]
 
 [tool.ruff]
@@ -54,6 +54,7 @@ select = [
     "UP", # pyupgrade
     "B",  # flake8-bugbear
     "A",  # flake8-builtins
+    "ARG", # flake8-unused-arguments
     "C4", # flake8-comprehensions
     "T20", # flake8-print (T201 for print, T203 for pprint)
     "SIM", # flake8-simplify

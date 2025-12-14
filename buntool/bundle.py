@@ -37,7 +37,6 @@ import logging
 # General
 import re
 import shutil
-import subprocess  # nosec B404
 import textwrap
 import zipfile
 from datetime import datetime
@@ -85,13 +84,11 @@ from buntool.makedocxindex import DocxConfig, create_toc_docx
 from buntool.textwrap_custom import dedent_and_log
 
 # Set globals
-PAGE_HEIGHT = defaultPageSize[1]
 PAGE_WIDTH = defaultPageSize[0]  # reportlab page sizes used in more than one function
 
 # Constants
 MIN_CSV_COLUMNS_WITH_SECTION = 4
 MIN_CSV_COLUMNS_NO_SECTION = 3
-MAX_TITLE_LENGTH_FOR_HYPERLINK_SEARCH = 30
 MIN_TOC_ENTRY_FIELDS = 3
 
 bundle_logger = logging.getLogger("bundle_logger")
@@ -171,52 +168,6 @@ def remove_temporary_files(list_of_temp_files):
         bundle_logger.info("[CB]..All temporary files deleted successfully.")
 
     return remaining_files
-
-
-def sanitise_latex(text):
-    """Homebrew LaTeX sanitiser.
-
-    Potential alternative available at: https://pythonhosted.org/latex/
-    which has an escape_latex function.
-
-    However, this is entirely unused in production: the LaTeX functionality
-    has been ported by ReportLab, which is more portable for deployment on AWS.
-    The LaTeX functions are maintained because they work well, look good, and I
-    sometimes prefer them for self-hosted use.
-
-    There's simple way of to enable LaTeX indexing. To make it work, replace calls
-    to reportlab style functions with calls to LaTeX functions, and alter the
-    values in the frontend 'index font' and 'footer font' form fields (in
-    buntool.js) to reference the expected font names which are used by LaTeX.
-    """
-    replacements = {
-        "_": "\\_",
-        "$": "\\$",
-        "%": "\\%",
-        "#": "\\#",
-        "{": "\\{",
-        "&": "\\&",
-        "}": "\\}",
-        "[": "{[}",
-        "]": "{]}",
-        '"': "{''}",
-        "|": "\\textbar{}",
-        "\\": "\\textbackslash{}",
-        "~": "\\textasciitilde{}",
-        "<": "\\textless{}",
-        ">": "\\textgreater{}",
-        "^": "\\textasciicircum{}",
-        "`": "{}`",
-        "\n": "\\\\",
-    }
-
-    # Remove emojis and other non-ASCII characters  (ascii list from space  0x20 onwards)
-    text = re.sub(r"[^\x20-\x7F]+", "", text)
-
-    # replace awkward ascii characters with LaTeX commands:
-    sanitised_text = "".join(replacements.get(c, c) for c in text)
-    bundle_logger.debug(f"[SL].... Sanitised input '{text}' for LaTeX output '{sanitised_text}'")
-    return sanitised_text
 
 
 def parse_the_date(date, bundle_config):
@@ -990,7 +941,7 @@ def generate_footer_pages_reportlab(filename, num_pages, bundle_config):
     doc.build(story, onFirstPage=footer_config_with_bundle, onLaterPages=footer_config_with_bundle)
 
 
-def reportlab_footer_config(canvas: Canvas, doc, bundle_config: BundleConfig, page_offset_override: int | None = None):
+def reportlab_footer_config(canvas: Canvas, _doc, bundle_config: BundleConfig, page_offset_override: int | None = None):
     """Configure the footer for ReportLab documents.
 
     the other reportlab functions during their build process.
@@ -1075,238 +1026,6 @@ def reportlab_footer_config(canvas: Canvas, doc, bundle_config: BundleConfig, pa
     canvas.restoreState()
 
 
-def get_index_font_family(index_font):
-    if index_font == "sans":
-        index_font_family = "phv"  # LaTeX font family for Helvetica, see https://www.overleaf.com/learn/latex/Font_typefaces#Reference_guide
-        bundle_logger.debug("[CTP]..Sans-serif font selected for TOC")
-    elif index_font == "serif":
-        index_font_family = "ppl"  # LaTeX font family for Palatino
-        bundle_logger.debug("[CTP]..Serif font selected for TOC")
-    elif index_font == "mono":
-        index_font_family = "pcr"  # LaTeX font family for Courier
-        bundle_logger.debug("[CTP]..Monospace font selected for TOC")
-    else:
-        index_font_family = ""  # Default to Computer modern
-        bundle_logger.debug("[CTP]..No font setting provided, using default font for TOC")
-    return index_font_family
-
-
-def get_footer_alignment_setting(page_num_align):
-    # parse alignment setting
-    if page_num_align == "left":
-        footer_alignment_setting = r"LO LE"
-        bundle_logger.debug("[MPNP]..Left alignment selected for page numbers")
-    elif page_num_align == "right":
-        footer_alignment_setting = r"RO RE"
-        bundle_logger.debug("[MPNP]..Right alignment selected for page numbers")
-    elif page_num_align == "centre":
-        footer_alignment_setting = r"CO CE"
-        bundle_logger.debug("[MPNP]..Centre alignment selected for page numbers")
-    else:
-        footer_alignment_setting = r"CO CE"
-        bundle_logger.debug("[MPNP]..Defaulting to centre alignment for page numbers")
-    return footer_alignment_setting
-
-
-def get_footer_font(_footer_font):
-    # parse font setting
-    if _footer_font == "sans":
-        footer_font = "phv"  # LaTeX font family for Helvetica, see https://www.overleaf.com/learn/latex/Font_typefaces#Reference_guide
-        bundle_logger.debug("[MPNP]..Sans-serif font selected for page numbers")
-    elif _footer_font == "serif":
-        footer_font = "ppl"  # LaTeX font family for Palatino
-        bundle_logger.debug("[MPNP]..Serif font selected for page numbers")
-    elif _footer_font == "mono":
-        footer_font = "pcr"  # LaTeX font family for Courier
-        bundle_logger.debug("[MPNP]..Monospace font selected for page numbers")
-    else:
-        footer_font = "cmr"  # LaTeX font family for Courier by default
-        bundle_logger.debug("[MPNP]..defaulting to Computer Modern Roman text font for page numbers")
-    return footer_font
-
-
-def get_footer_text(footer_prefix, page_num_style, main_page_count, frontmatter_offset):
-    # Map page numbering styles to their format strings and log messages
-    style_data = {
-        "x": (r"\thepage", "x"),
-        "x_of_y": (r"\thepage{} of " + str(main_page_count + frontmatter_offset), "x of y"),
-        "page_x": (r"Page \thepage", "Page x"),
-        "page_x_of_y": (r"Page \thepage{} of " + str(main_page_count + frontmatter_offset), "Page x of y"),
-        "x_slash_y": (r"\thepage /" + str(main_page_count + frontmatter_offset), "x / y"),
-    }
-
-    # Get style data or use defaults
-    page_part, style_name = style_data.get(page_num_style, (r"Page \thepage", "Page x"))
-    bundle_logger.debug(f"[MPNP]..Page numbering style: {style_name}")
-
-    # Build the complete string in one assignment
-    if footer_prefix:
-        sanitized_prefix = sanitise_latex(footer_prefix.strip() + " ")
-        bundle_logger.debug(f"[MPNP]..Prefixing page numbers with '{sanitized_prefix}'")
-        return sanitized_prefix + page_part
-    else:
-        return page_part
-
-
-toc_content_prefix = r"""
-\documentclass[12pt,a4paper]{article}
-\usepackage{fancyhdr}
-\usepackage{geometry}
-\usepackage{hyperref}
-\usepackage{longtable}
-\usepackage{color, colortbl}
-"""
-
-
-def get_non_roman(footer_font, starting_page, footer_alignment_setting, footer_text):
-    return f"""
-        \\newcommand{{\\fontsetting}}{{\\fontfamily{{{footer_font}}}\\fontseries{{b}}\\base_font_size{{18}}{{22}}\\selectfont}}
-        \\setcounter{{page}}{{{starting_page}}}
-        \\begin{{document}}
-        \\pagestyle{{fancy}}
-        \\renewcommand{{\\headrulewidth}}{{0pt}}
-        \\setlength{{\\footskip}}{{20pt}}
-        \\fancyhf{{}} % to clear the header and the footer simultaneously
-        \\fancyfoot[{footer_alignment_setting}]{{\\fontsetting {footer_text}}}
-        """
-
-
-def get_last_foot(date_col_width, date_col_hdr):
-    return rf"""
-        \def\arraystretch{{1.3}}
-        \begin{{longtable}}{{p{{1.2cm}} p{{10cm}} p{{{date_col_width}}} r}}
-        \hline
-        \textbf{{Tab}} & \textbf{{Title}} & \textbf{{{date_col_hdr}}} & \textbf{{Page}} \\
-        \hline
-        \endfirsthead
-        \hline
-        \textbf{{Tab}} & \textbf{{Title}} & \textbf{{{date_col_hdr}}} & \textbf{{Page}} \\
-        \hline
-        \endhead
-        \hline
-        \endfoot
-        \hline
-        \endlastfoot
-        """
-
-
-bn1 = r"""
-\begin{center}
-\rule{0.5\linewidth}{0.3mm} \\
-\vspace{0.3cm}
-"""
-bn2 = r"""
-\rule{0.5\linewidth}{0.3mm} \\
-\vspace{-0.5cm}
-\end{center}
-"""
-
-
-class FooterTexConfig(NamedTuple):
-    """Configuration for TeX-based footer generation."""
-
-    length_of_frontmatter_offset: int
-    main_page_count: int
-    page_num_alignment: str
-    page_num_font: str
-    page_numbering_style: str
-    footer_prefix: str
-
-
-def _get_tex_font_settings(bundle_config_index_font):
-    """Determine LaTeX font family for TOC."""
-    if bundle_config_index_font == "sans":
-        return "phv"  # Helvetica
-    if bundle_config_index_font == "serif":
-        return "ppl"  # Palatino
-    if bundle_config_index_font == "mono":
-        return "pcr"  # Courier
-    return ""  # Default to Computer modern
-
-
-def _get_tex_alignment_setting(bundle_config_page_num_align):
-    """Determine LaTeX alignment setting for footer."""
-    if bundle_config_page_num_align == "left":
-        return r"LO LE"
-    if bundle_config_page_num_align == "right":
-        return r"RO RE"
-    if bundle_config_page_num_align == "centre":
-        return r"CO CE"
-    return r"CO CE"  # Default
-
-
-def _get_tex_page_numbering_text(config: FooterTexConfig, footer_text_prefix):
-    """Determine LaTeX page numbering style text for footer."""
-    (length_of_frontmatter_offset, main_page_count, _, _, page_numbering_style, _) = config
-    if page_numbering_style == "x":
-        return footer_text_prefix + r"\thepage"
-    if page_numbering_style == "x_of_y":
-        return footer_text_prefix + r"\thepage{} of " + str(main_page_count + length_of_frontmatter_offset)
-    if page_numbering_style == "page_x":
-        return footer_text_prefix + r"Page \thepage"
-    if page_numbering_style == "page_x_of_y":
-        return footer_text_prefix + r"Page \thepage{} of " + str(main_page_count + length_of_frontmatter_offset)
-    if page_numbering_style == "x_slash_y":
-        return footer_text_prefix + r"\thepage /" + str(main_page_count + length_of_frontmatter_offset)
-    return footer_text_prefix + r"Page \thepage"  # Default
-
-
-def generate_footer_pages_tex(
-    page_numbers_tex_path,
-    config: FooterTexConfig,
-):
-    """Generate a PDF of page numbers using TeX.
-
-    replaced by Reportlab version: make_page_numbers_pdf_reportlab.
-    """
-    (length_of_frontmatter_offset, main_page_count, page_num_alignment, page_num_font, _, footer_prefix) = config
-    starting_page = length_of_frontmatter_offset + 1
-    footer_alignment_setting = _get_tex_alignment_setting(page_num_alignment)
-    footer_font = _get_tex_font_settings(page_num_font)
-    footer_text_prefix = sanitise_latex(footer_prefix.strip() + " ") if footer_prefix else ""
-    footer_text = _get_tex_page_numbering_text(config, footer_text_prefix)
-
-    # Create LaTeX file for page numbers
-    page_number_footer_tex = rf"""
-        \documentclass[12pt,a4paper]{{article}}
-        \usepackage{{fancyhdr}}
-        \usepackage{{multido}}
-        \usepackage[hmargin=.8cm,vmargin=1.1cm,nohead,nofoot,twoside]{{geometry}}
-        \newcommand{{\fontsetting}}{{\fontfamily{{{footer_font}}}\fontseries{{b}}\fontsize{{18}}{{22}}\selectfont}}
-        \setcounter{{page}}{{{starting_page}}}
-        \begin{{document}}
-        \pagestyle{{fancy}}
-        \renewcommand{{\headrulewidth}}{{0pt}}
-        \setlength{{\footskip}}{{20pt}}
-        \fancyhf{{}} % to clear the header and the footer simultaneously
-        \fancyfoot[{footer_alignment_setting}]{{\fontsetting {footer_text}}}
-        \multido{{}}{{{main_page_count}}}{{\vphantom{{x}}\newpage}}
-        \end{{document}}
-        """
-
-    with Path(page_numbers_tex_path).open("w") as f:
-        f.write(page_number_footer_tex)
-    bundle_logger.debug(f"[MPNP]Page numbers content written to file: {page_numbers_tex_path}")
-
-    page_numbers_pdf_path = str(page_numbers_tex_path).replace(".tex", ".pdf")
-    # Compile LaTeX file to PDF
-    command = [
-        "pdflatex",
-        "-output-directory",
-        str(Path(page_numbers_pdf_path).parent),
-        str(page_numbers_tex_path),
-    ]
-    # Use subprocess.run for security, redirecting stdout and stderr to DEVNULL
-    process = subprocess.run(command, capture_output=True, text=True, check=False)  # nosec B603
-    result = process.returncode
-
-    if result != 0:
-        bundle_logger.error(f"[MPNP]pdflatex command failed with error code {result}")
-    else:
-        bundle_logger.debug(f"[MPNP]pdflatex command succeeded. Page numbers PDF saved to {page_numbers_pdf_path}")
-    return page_numbers_pdf_path
-
-
 def add_footer_to_bundle(input_file, page_numbers_pdf_path, output_file):
     """Overlay a footer PDF onto a content PDF.
 
@@ -1377,44 +1096,6 @@ def pdf_paginator_reportlab(input_file, bundle_config: BundleConfig, output_file
     return main_page_count
 
 
-def pdf_paginator_tex(input_file, output_file, bundle_config: BundleConfig, frontmatter_offset):
-    """Manage pagination using TeX.
-
-    This is the pagination manager for generate_footer_pages_tex and add_footer_to_bundle.
-    It makes sure they are supplied with the correct information.
-    """
-    bundle_logger.debug("[PPPaginate PDF function beginning")
-    main_page_count = 0
-    try:
-        main_page_count = len(Pdf.open(input_file).pages)
-        bundle_logger.debug(f"[PP..Main PDF opened with {main_page_count} pages")
-    except Exception:
-        bundle_logger.exception("[PP..Error counting pages in TOC")
-        raise
-    output_dir = Path(output_file).parent
-    page_numbers_tex_path = output_dir / "pageNumbers.tex"
-    footer_config = FooterTexConfig(
-        main_page_count,
-        frontmatter_offset,
-        bundle_config.page_num_align,
-        bundle_config.footer_font,
-        bundle_config.page_num_style,
-        bundle_config.footer_prefix,
-    )
-    page_numbers_pdf_output = generate_footer_pages_tex(page_numbers_tex_path, footer_config)
-
-    if Path(page_numbers_pdf_output).exists():
-        try:
-            add_footer_to_bundle(input_file, page_numbers_pdf_output, output_file)
-            bundle_logger.debug("[PP] Page numbers overlaid on main PDF")
-        except Exception:
-            bundle_logger.exception("[PPError overlaying page numbers")
-            raise
-    else:
-        bundle_logger.error("[PPError creating page numbers PDF: see pdftex temporary logs in temp folder.")
-    return main_page_count
-
-
 def add_roman_labels(pdf_file, length_of_frontmatter, output_file):
     """Adjust page numbering to begin with Roman numerals for the frontmatter.
 
@@ -1434,23 +1115,6 @@ def add_roman_labels(pdf_file, length_of_frontmatter, output_file):
 
         pdf.Root.PageLabels = Dictionary(Nums=nums)
         pdf.save(output_file)
-
-
-def process_csv_index(csv_index):
-    """Process CSV index data from a string..
-
-    This is a stub of a test idea to allow passing csv info as a raw argument
-    via command line.
-    The functionality has been overtaken by the frontend-generated
-    CSV file.
-    """
-    index_data = {}
-
-    for row in csv_index:
-        if (row["Type"] == "File") and (row["Filename"] not in index_data):
-            index_data[row["Filename"]] = (row["Title"], row["Date"], row["Section"])
-
-    return index_data
 
 
 def transform_coordinates(coords, page_height):
@@ -1511,16 +1175,6 @@ def add_annotations_with_transform(pdf_file, list_of_annotation_coords, output_f
         writer.write(output)
 
 
-class AddHyperlinksParams(NamedTuple):
-    pdf_file: Path
-    output_file: Path
-    length_of_coversheet: int
-    length_of_frontmatter: int
-    toc_entries: list[tuple[str, str, str, str]]
-    date_setting: str = "show_date"
-    roman_page_labels: bool = False
-
-
 def get_scraped_pages_text(pdf: PDF, idx: int):
     current_page = pdf.pages[idx]
     bundle_logger.debug(f"[HYP]..Processing page {idx} for TOC text extraction")
@@ -1579,39 +1233,6 @@ def add_hyperlinks(pdf_file, output_file, length_of_coversheet, length_of_frontm
 
     # Step 3: Add annotations to the PDF
     add_annotations_with_transform(pdf_file, list_of_annotation_coords, output_file)
-
-
-class TocTexConfig(NamedTuple):
-    bundle_config: BundleConfig
-    roman_numbering: bool
-    length_of_coversheet: int
-    frontmatter_offset: int
-    main_page_count: int
-    date_setting: str
-    confidential: bool
-    dummy: bool
-
-
-def _create_tex_footer_string(config: TocTexConfig):
-    """Generate the footer string for the TeX TOC."""
-    (bundle_config, roman_numbering, length_of_coversheet, frontmatter_offset, main_page_count, _, _, _) = config
-    bundle_logger.debug("[CTP]Creating TOC PDF. Parsing settings:")
-
-    index_font_family = None
-    footer_font = None
-    starting_page = 1
-    footer_alignment_setting = None
-    footer_text = None
-    if not roman_numbering:
-        # parse index font setting
-        # set starting page to be one more than the length_of_coversheet
-        starting_page = length_of_coversheet + 1
-        index_font_family = get_index_font_family(bundle_config.index_font)
-        footer_alignment_setting = get_footer_alignment_setting(bundle_config.page_num_align)
-        footer_font = get_footer_font(bundle_config.footer_font)
-        footer_text = get_footer_text(bundle_config.footer_prefix, bundle_config.page_num_style, main_page_count, frontmatter_offset)
-
-    return footer_alignment_setting, footer_font, footer_text, index_font_family, starting_page
 
 
 def _initialize_bundle_creation(bundle_config_data: BundleConfig, output_file, coversheet, input_files, index_file):
