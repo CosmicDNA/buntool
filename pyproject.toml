@@ -88,8 +88,8 @@ line-ending = "auto"
 buntool = "buntool.app:main"
 
 [tool.setuptools]
-packages = ["buntool"]
+packages = {find = {}}
 include-package-data = true
 
 [tool.setuptools.package-data]
-"buntool" = ["static/**"]
+"buntool" = ["static/**", "templates/**"]
