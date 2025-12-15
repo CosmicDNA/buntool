@@ -45,8 +45,11 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pdfplumber
+
+# reportlab stuff
 import reportlab.rl_config
 from colorlog import ColoredFormatter
+from pdfplumber.page import Page as PlumberPage
 from pdfplumber.pdf import PDF
 from pikepdf import OutlineItem, Pdf
 from pikepdf._core import Page
@@ -54,8 +57,6 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import Link
 from pypdf.generic import DictionaryObject as Dictionary
 from pypdf.generic import NameObject as Name
-
-# reportlab stuff
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from reportlab.lib.pagesizes import A4
@@ -76,9 +77,9 @@ from reportlab.platypus import (
 from reportlab.rl_config import defaultPageSize
 from werkzeug.utils import secure_filename
 
-from buntool.bundle_config import BundleConfig, BundleConfigParams
-
 # custom
+from buntool.bundle_config import BundleConfig, BundleConfigParams
+from buntool.headers import HEADERS
 from buntool.makedocxindex import DocxConfig, create_toc_docx
 from buntool.textwrap_custom import dedent_and_log
 
@@ -394,21 +395,18 @@ def get_bookmarks(path: Path):
         bundle_logger.exception(f"Error reading bookmarks from {path.name}")
 
 
-def is_bundle(pdf: Pdf, case_details: dict) -> int:
-    MIN_AMOUNT_SPLITS = 2
-
+def is_bundle(pdf: Pdf) -> int:
     with pdfplumber.open(pdf.filename) as plumber_pdf:
 
-        def is_toc_page(lines: list[dict], case_details: dict) -> bool:
-            if len(lines) < MIN_AMOUNT_SPLITS:
-                return False
-            texts = [line.get("text") for line in lines]
-            return texts[0] == case_details.get("claim_no") and texts[1] == case_details.get("case_name")
+        def is_toc_page(page: PlumberPage) -> bool:
+            table = page.extract_table()
+            if table and table[0]:
+                return table[0][0] == " ".join(HEADERS)
+            return False
 
         toc_pages_n = 0
         for page in plumber_pdf.pages:
-            lines = page.extract_text_lines()
-            if is_toc_page(lines, case_details):
+            if is_toc_page(page):
                 toc_pages_n = toc_pages_n + 1
             else:
                 break
@@ -667,10 +665,9 @@ def _build_reportlab_table_data(table_data_params: TableDataParams):
     (toc_entries, date_col_hdr, dummy, page_offset, style_sheet, bundle_title) = table_data_params
     list_of_section_breaks = [rowidx for rowidx, current_row_tuple in enumerate(toc_entries) if "SECTION_BREAK" in current_row_tuple[0]]
 
-    headers = ("Tab", "Title", "Date", "Page")
-    header_row = _create_header(headers, style_sheet)
+    header_row = _create_header(HEADERS, style_sheet)
     reportlab_table_data = [
-        _create_reportlab_row(CreateReportlabRowParams(row, date_col_hdr, dummy, page_offset, style_sheet, headers)) for row in toc_entries
+        _create_reportlab_row(CreateReportlabRowParams(row, date_col_hdr, dummy, page_offset, style_sheet, HEADERS)) for row in toc_entries
     ]
 
     reportlab_table_data.insert(0, header_row)  # Insert header row at the top
@@ -1512,7 +1509,7 @@ def _adjust_inner_bundle_links(pdf_path: Path, bundle_config: BundleConfig, toc_
                 continue
 
             with Pdf.open(src_path) as src_pdf:
-                num_toc_pages = is_bundle(src_pdf, bundle_config.case_details)
+                num_toc_pages = is_bundle(src_pdf)
                 if num_toc_pages > 0:
                     # This is a nested bundle. Adjust its links.
                     # The final start page of this inner bundle's content in the assembled PDF.

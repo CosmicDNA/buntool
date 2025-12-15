@@ -6,6 +6,8 @@ from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
 from docx.shared import Pt, RGBColor
 from docx.styles.style import CharacterStyle
 
+from buntool.headers import HEADERS
+
 
 @dataclass
 class DocxConfig:
@@ -67,10 +69,10 @@ def _create_and_populate_table(doc: DocumentObject, toc_entries, date_setting):
     table.style = "Table Grid"
 
     header_cells = table.rows[0].cells
-    header_cells[0].text = "Tab"
-    header_cells[1].text = "Title"
-    header_cells[2].text = "Date" if date_setting else ""
-    header_cells[3].text = "Page"
+    header_cells[0].text = HEADERS[0]
+    header_cells[1].text = HEADERS[1]
+    header_cells[2].text = HEADERS[2] if date_setting else ""
+    header_cells[3].text = HEADERS[3]
     for cell in header_cells:
         run = cell.paragraphs[0].runs[0]
         run.bold = True
