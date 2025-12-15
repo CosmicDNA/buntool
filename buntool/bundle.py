@@ -45,7 +45,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 import pdfplumber
-import pymupdf  # imports the pymupdf library
 import reportlab.rl_config
 from colorlog import ColoredFormatter
 from pdfplumber.pdf import PDF
@@ -396,23 +395,24 @@ def get_bookmarks(path: Path):
 
 
 def is_bundle(pdf: Pdf, case_details: dict) -> int:
-    MIN_AMOUNT_SPLITS = 3
-    doc = pymupdf.open(pdf.filename)  # open a document
+    MIN_AMOUNT_SPLITS = 2
 
-    def is_toc_page(page_text: str, case_details: dict) -> bool:
-        split_text = page_text.split("\n")
-        if len(split_text) < MIN_AMOUNT_SPLITS:
-            return False
-        return split_text[1] == case_details.get("claim_no") and split_text[2] == case_details.get("case_name")
+    with pdfplumber.open(pdf.filename) as plumber_pdf:
 
-    toc_pages_n = 0
-    for page in doc[:]:
-        page_text = page.get_text()
-        if isinstance(page_text, str) and is_toc_page(page_text, case_details):
-            toc_pages_n = toc_pages_n + 1
-        else:
-            break
-    return toc_pages_n
+        def is_toc_page(lines: list[dict], case_details: dict) -> bool:
+            if len(lines) < MIN_AMOUNT_SPLITS:
+                return False
+            texts = [line.get("text") for line in lines]
+            return texts[0] == case_details.get("claim_no") and texts[1] == case_details.get("case_name")
+
+        toc_pages_n = 0
+        for page in plumber_pdf.pages:
+            lines = page.extract_text_lines()
+            if is_toc_page(lines, case_details):
+                toc_pages_n = toc_pages_n + 1
+            else:
+                break
+        return toc_pages_n
 
 
 def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
