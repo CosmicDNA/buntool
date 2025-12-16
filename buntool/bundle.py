@@ -101,6 +101,10 @@ def configure_logger(bundle_config, session_id=None):
     Since the temp files are deleted in production,
     logs are to be stored in a seprate file /tmp/logs.
     """
+    # Suppress noisy warnings from pdfminer, which is used by pdfplumber
+    logging.getLogger("pdfminer.pdfinterp").setLevel(logging.ERROR)
+    logging.getLogger("pdfminer.pdfpage").setLevel(logging.ERROR)
+
     logs_dir = bundle_config.logs_dir if bundle_config else "logs"
 
     if not Path(logs_dir).exists():
@@ -526,24 +530,41 @@ def add_bookmarks_to_pdf(pdf_file, output_file, toc_entries, length_of_frontmatt
         "tab-title-page"
         "tab-title-date-page
     """
+    PAGE_NUMBER_INDEX = 3
     with Pdf.open(pdf_file) as pdf:
-        # Create all bookmark items at once using a list comprehension
-        bookmark_items = [
-            _create_bookmark_item(entry, length_of_frontmatter, bundle_config)
-            for entry in toc_entries
-            if "SECTION_BREAK" not in entry[0] and not ("tab" in str(entry[0]).lower() and "title" in str(entry[1]).lower())
-        ]
-
         with pdf.open_outline() as outline:
-            # Extend the root outline with the pre-built list of items
-            outline.root.extend(bookmark_items)
+            current_section_bookmark = None
+            main_bookmark_map = {}
+
+            for entry in toc_entries:
+                # Skip the header row if it's present in toc_entries
+                if "tab" in str(entry[0]).lower() and "title" in str(entry[1]).lower():
+                    continue
+
+                if "SECTION_BREAK" in entry[0]:
+                    # This is a section header. Create a new top-level bookmark for it.
+                    # Sections don't have a page destination, so we can use the page of the next item.
+                    # pikepdf requires a destination, so we'll find the next item's page.
+                    next_item_index = toc_entries.index(entry) + 1
+                    destination_page = 0  # Default destination
+                    if next_item_index < len(toc_entries) and len(toc_entries[next_item_index]) > PAGE_NUMBER_INDEX:
+                        destination_page = toc_entries[next_item_index][PAGE_NUMBER_INDEX] + length_of_frontmatter
+
+                    section_title = entry[1]
+                    current_section_bookmark = OutlineItem(section_title, destination_page)
+                    outline.root.append(current_section_bookmark)
+                else:
+                    # This is a file entry.
+                    bookmark_item = _create_bookmark_item(entry, length_of_frontmatter, bundle_config)
+                    main_bookmark_map[bookmark_item.title] = bookmark_item
+                    if current_section_bookmark:
+                        current_section_bookmark.children.append(bookmark_item)
+                    else:
+                        outline.root.append(bookmark_item)
 
             # Now, add the sub-bookmarks under their correct parent in the main TOC
             if bundle_config.all_sub_bookmarks:
                 bundle_logger.debug(f"Adding {len(bundle_config.all_sub_bookmarks)} sub-bookmarks to the final PDF.")
-
-                # Create a mapping from main bookmark title to the OutlineItem object
-                main_bookmark_map = {item.title: item for item in bookmark_items}
 
                 for sub_bookmark_group in bundle_config.all_sub_bookmarks:
                     parent_title = sub_bookmark_group["parent_title"]
