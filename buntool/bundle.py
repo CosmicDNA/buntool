@@ -573,9 +573,26 @@ def add_bookmarks_to_pdf(pdf_file, output_file, toc_entries, length_of_frontmatt
                     # Find the parent OutlineItem in the main TOC
                     parent_bookmark = main_bookmark_map.get(f"{sub_bookmark_group['tab']} {parent_title}")
                     if parent_bookmark:
-                        for title, page_num, _ in bookmarks_to_add:
-                            final_page_num = page_num + length_of_frontmatter
-                            parent_bookmark.children.append(OutlineItem(title, final_page_num))
+                        # Reconstruct the hierarchy for sub-bookmarks
+                        level_map = {0: parent_bookmark}
+                        for title, page_num, level in bookmarks_to_add:
+                            # The level from the source PDF is 0-based for its own root.
+                            # We need to add it under the parent_bookmark, so its effective level is level + 1.
+                            effective_level = level + 1
+
+                            # Find the correct parent for the current item's level.
+                            # The parent is at the preceding level.
+                            parent_for_current_item = level_map.get(effective_level - 1)
+
+                            if parent_for_current_item:
+                                final_page_num = page_num + length_of_frontmatter
+                                new_item = OutlineItem(title, final_page_num)
+                                parent_for_current_item.children.append(new_item)
+                                # Store this new item in the map at its own level,
+                                # so it can become a parent for subsequent, more deeply nested items.
+                                level_map[effective_level] = new_item
+                            else:
+                                bundle_logger.warning(f"Could not find parent for sub-bookmark '{title}' at level {level}.")
 
         pdf.save(output_file)
 
