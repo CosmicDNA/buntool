@@ -40,7 +40,7 @@ import shutil
 import textwrap
 import zipfile
 from datetime import datetime
-from itertools import count
+from itertools import count, groupby
 from pathlib import Path
 from typing import NamedTuple
 
@@ -51,12 +51,8 @@ import reportlab.rl_config
 from colorlog import ColoredFormatter
 from pdfplumber.page import Page as PlumberPage
 from pdfplumber.pdf import PDF
-from pikepdf import OutlineItem, Pdf
+from pikepdf import Array, Dictionary, Name, OutlineItem, Pdf, Rectangle
 from pikepdf._core import Page
-from pypdf import PdfReader, PdfWriter
-from pypdf.annotations import Link
-from pypdf.generic import DictionaryObject as Dictionary
-from pypdf.generic import NameObject as Name
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from reportlab.lib.pagesizes import A4
@@ -257,45 +253,41 @@ def load_index_data(csv_index, bundle_config):
     return index_data
 
 
-def get_pdf_creation_date(file):
+def get_pdf_creation_date(pdf: Pdf):
     """Extracts the creation date from a PDF file.
 
     This is purely a fallback function in case the
     user-supplied (or frontend-supplied) information is missing a date.
     """
     try:
-        with Pdf.open(file) as pdf:
-            creation_date = pdf.docinfo.get("/CreationDate", None)
-            if creation_date:
-                # Convert to string if it's a pikepdf.String object
-                creation_date_str = str(creation_date)
-                # Extract date in the format D:YYYYMMDDHHmmSS
-                date_str = creation_date_str[2:10]
-                date_obj = datetime.strptime(date_str, "%Y%m%d")
-                return date_obj.strftime("%d.%m.%Y")
+        creation_date = pdf.docinfo.get("/CreationDate")
+        if creation_date:
+            # Convert to string if it's a pikepdf.String object
+            creation_date_str = str(creation_date)
+            # Extract date in the format D:YYYYMMDDHHmmSS
+            date_str = creation_date_str[2:10]
+            date_obj = datetime.strptime(date_str, "%Y%m%d")
+            return date_obj.strftime("%d.%m.%Y")
     except Exception:
-        bundle_logger.exception(f"[GPCD]Error extracting creation date from {file}")
-        creation_date = None
+        bundle_logger.exception(f"[GPCD]Error extracting creation date from {pdf.filename}")
         return None
 
 
 class TocEntryParams(NamedTuple):
     item: tuple
     page_counts: dict
+    pdf: Pdf
     tab_counts: count
     section_counts: count
-    index_data: dict
-    input_files: list
 
 
-def _generate_toc_entry(toc_entry_params: TocEntryParams):
+def _generate_toc_entry(toc_entry_params: TocEntryParams) -> tuple | None:
     """Generate a single TOC entry tuple for a given item from the index."""
     item = toc_entry_params.item
     page_counts = toc_entry_params.page_counts
     tab_counts = toc_entry_params.tab_counts
     section_counts = toc_entry_params.section_counts
-    index_data = toc_entry_params.index_data
-    input_files = toc_entry_params.input_files
+    pdf = toc_entry_params.pdf
 
     filename, (title, _, section) = item
 
@@ -307,37 +299,16 @@ def _generate_toc_entry(toc_entry_params: TocEntryParams):
     tab_number = f"{next(tab_counts):03}."
     current_page_start = page_counts["total"]
 
-    # Find the full path for the file
-    this_file_path = next((path for path in input_files if path.name == Path(filename).name), None)
+    num_pages = len(pdf.pages)
+    page_counts["total"] += num_pages
 
-    if not this_file_path or not this_file_path.exists():
-        bundle_logger.warning(f"[MPCTE] File {filename} not found in input_files. Skipping.")
-        return None
+    entry_title = title
+    entry_date = item[1][1]  # The formatted date from the index data
 
-    try:
-        with Pdf.open(this_file_path) as src:
-            num_pages = len(src.pages)
-            page_counts["total"] += num_pages
+    if entry_date == "Unknown":
+        entry_date = get_pdf_creation_date(pdf) or "Unknown"
 
-        entry_title, entry_date, _ = index_data.get(Path(filename).name, (Path(filename).stem, "Unknown", ""))
-        if entry_date == "Unknown":
-            entry_date = get_pdf_creation_date(this_file_path) or "Unknown"
-    except Exception:
-        bundle_logger.exception(f"Error processing file {this_file_path} for TOC.")
-        return None
-    else:
-        return (tab_number, entry_title, entry_date, current_page_start)
-
-
-def get_pages(input_files, filename) -> tuple[Pdf, list[Page]] | tuple[None, list]:
-    this_file_path = next((path for path in input_files if path.name == Path(filename).name), None)
-    if this_file_path and this_file_path.exists():
-        try:
-            src = Pdf.open(this_file_path)
-            return src, src.pages[:]
-        except Exception:
-            bundle_logger.exception(f"Error merging file {this_file_path}")
-    return None, []
+    return (tab_number, entry_title, entry_date, current_page_start)
 
 
 def _is_page_blank(page: PlumberPage) -> bool:
@@ -349,81 +320,94 @@ def _is_page_blank(page: PlumberPage) -> bool:
     return is_blank
 
 
-def get_and_adjust_bookmarks(path: Path, page_offset: int) -> list[tuple[str, int, int]]:
+def get_and_adjust_bookmarks(pdf: Pdf, page_offset: int) -> list[tuple[str, int, int]]:
     """Reads a PDF's bookmarks, adjusts their page destinations by an offset.
 
     And returns them as a list of (title, page_number, level) tuples.
     """
     adjusted_bookmarks = []
-    bundle_logger.debug(f"Adjusting bookmarks for '{path.name}' with page offset {page_offset}")
     try:
-        reader = PdfReader(path)
-        if not reader.outline:
-            bundle_logger.debug(f"  - No bookmarks found in '{path.name}' to adjust.")
+        if not pdf.Root.get("/Outlines"):
+            bundle_logger.debug(f"  - No bookmarks found in '{pdf.filename}' to adjust.")
             return []
 
-        def _traverse_and_adjust(items, level=0):
-            """Recursively traverse, adjust, and collect outline items as tuples."""
+        def _flatten_bookmarks(items, level=0):
+            """A generator to recursively yield all bookmarks as a flat list."""
             for item in items:
-                if isinstance(item, list):
-                    _traverse_and_adjust(item, level + 1)
-                else:
-                    page_num = reader.get_destination_page_number(item)
-                    if page_num is not None:
-                        new_page_num = page_num + page_offset
-                        log_msg = (
-                            f"  - Adjusting bookmark '{item.title}': original page {page_num} + offset {page_offset} -> new page {new_page_num}"
-                        )
-                        bundle_logger.debug(log_msg)
-                        adjusted_bookmarks.append((item.title, new_page_num, level))
+                if item.destination is not None:
+                    yield item, level
+                if item.children:
+                    yield from _flatten_bookmarks(item.children, level + 1)
 
-        _traverse_and_adjust(reader.outline)
-        bundle_logger.info(f"Found and adjusted {len(adjusted_bookmarks)} bookmarks in {path.name}")
+        def get_page_index_from_destination(dest):
+            """Safely get the page index from a bookmark destination."""
+            if isinstance(dest, (list, Array)) and dest:
+                page_obj = dest[0]
+                if isinstance(page_obj, Page):
+                    return pdf.pages.index(page_obj)
+            if isinstance(dest, int):
+                return dest
+            return -1  # Should not happen due to the check in _flatten_bookmarks
+
+        with pdf.open_outline() as outline:
+            # Use a list comprehension to process the flattened bookmarks
+            adjusted_bookmarks = [
+                (item.title, get_page_index_from_destination(item.destination) + page_offset, level)
+                for item, level in _flatten_bookmarks(outline.root)
+                if get_page_index_from_destination(item.destination) != -1
+            ]
+
+        bundle_logger.info(f"Found and adjusted {len(adjusted_bookmarks)} bookmarks in {pdf.filename}")
+        for title, new_page, level in adjusted_bookmarks:
+            bundle_logger.debug(f"  - Bookmark '{title}' at level {level} adjusted to page {new_page}")
     except Exception:
-        bundle_logger.exception(f"Error reading and adjusting bookmarks from {path.name}")
+        bundle_logger.exception(f"Error reading and adjusting bookmarks from {pdf.filename}")
     return adjusted_bookmarks
 
 
-def get_bookmarks(path: Path):
+def get_bookmarks(pdf: Pdf):
     """Reads a PDF and logs its bookmarks (outline)."""
     try:
-        reader = PdfReader(path)
-        if not reader.outline:
-            bundle_logger.info(f"No bookmarks found in {path.name}")
+        if not pdf.Root.get("/Outlines"):
+            bundle_logger.info(f"No bookmarks found in {pdf.filename}")
             return
 
         def _traverse_outline(items, level=0):
             """Recursively traverse and log outline items."""
             for item in items:
-                if isinstance(item, list):
-                    _traverse_outline(item, level + 1)
-                else:
-                    # item.get("/Page")
-                    # Use get_destination_page_number for robustness
-                    page_num = reader.get_destination_page_number(item)
-                    bundle_logger.info(f"{'  ' * level}Bookmark: '{item.title}' -> Page {page_num}")
+                if item.destination:
+                    try:
+                        page_obj = item.destination[0]
+                        if isinstance(page_obj, Page):
+                            page_num = pdf.pages.index(page_obj)
+                            bundle_logger.info(f"{'  ' * level}Bookmark: '{item.title}' -> Page {page_num}")
+                    except (ValueError, IndexError):
+                        bundle_logger.warning(f"{'  ' * level}Bookmark: '{item.title}' -> Invalid destination")
+                if item.children:
+                    _traverse_outline(item.children, level + 1)
 
-        _traverse_outline(reader.outline)
+        with pdf.open_outline() as outline:
+            _traverse_outline(outline.root)
     except Exception:
-        bundle_logger.exception(f"Error reading bookmarks from {path.name}")
+        bundle_logger.exception(f"Error reading bookmarks from {pdf.filename}")
 
 
-def is_bundle(pdf: Pdf) -> int:
-    with pdfplumber.open(pdf.filename) as plumber_pdf:
+def is_bundle(plumber_pdf: PDF) -> int:
+    """Checks if a pdfplumber PDF object is a bundle by looking for a TOC."""
 
-        def is_toc_page(page: PlumberPage) -> bool:
-            table = page.extract_table()
-            if table and table[0]:
-                return table[0][0] == " ".join(HEADERS)
-            return False
+    def is_toc_page(page: PlumberPage) -> bool:
+        table = page.extract_table()
+        if table and table[0]:
+            return table[0][0] == " ".join(HEADERS)
+        return False
 
-        toc_pages_n = 0
-        for page in plumber_pdf.pages:
-            if is_toc_page(page):
-                toc_pages_n = toc_pages_n + 1
-            else:
-                break
-        return toc_pages_n
+    toc_pages_n = 0
+    for page in plumber_pdf.pages:
+        if is_toc_page(page):
+            toc_pages_n += 1
+        else:
+            break
+    return toc_pages_n
 
 
 def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
@@ -444,69 +428,57 @@ def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
     page_counts = {"total": 0}  # Use a mutable dict to track page count across list comprehension
     tab_counts = count(1)
     section_counts = count(1)
-
-    # Generate TOC entries
-    toc_entries = [
-        entry
-        for item in index_data.items()
-        if (entry := _generate_toc_entry(toc_entry_params=TocEntryParams(item, page_counts, tab_counts, section_counts, index_data, input_files)))
-        is not None
-    ]
-
-    # Now, merge the PDFs in the correct order
-    non_section_breaks = [filename for filename, (_, _, section) in index_data.items() if section != "1"]
-
-    opened_pdfs: list[Pdf] = []
-    all_sub_bookmarks: list[dict] = []
+    toc_entries = []
+    all_sub_bookmarks: list = []
+    is_bundle_map = {}  # To store results of is_bundle checks
     current_page_offset = 0
 
     try:
-        for filename in non_section_breaks:
-            # Find the corresponding TOC entry to get the parent title and tab
-            # The title in the TOC entry is the second element (index 1).
-            # We need to find the original filename from the index_data that corresponds to this title.
-            title_to_filename_map = {v[0]: k for k, v in index_data.items()}
-            toc_entry = next(
-                (entry for entry in toc_entries if len(entry) >= MIN_TOC_ENTRY_FIELDS and title_to_filename_map.get(entry[1]) == filename), None
-            )
+        for filename, (title, _, section) in index_data.items():
+            if section == "1":
+                section_num = next(section_counts)
+                toc_entries.append((f"SECTION_BREAK_{section_num}", title))
+                continue
 
-            src_pdf, pages = get_pages(input_files, filename)
-            if src_pdf:
-                this_file_path = next((path for path in input_files if path.name == Path(filename).name), None)
-                if this_file_path:
-                    # Check for blank pages
-                    with pdfplumber.open(this_file_path) as plumber_pdf:
-                        for page in plumber_pdf.pages:
-                            if _is_page_blank(page):
-                                bundle_logger.warning(f"Blank page detected in '{this_file_path.name}' on page {page.page_number}.")
-                    sub_bookmarks = get_and_adjust_bookmarks(this_file_path, current_page_offset)
+            this_file_path = next((path for path in input_files if path.name == Path(filename).name), None)
+            if this_file_path and this_file_path.exists():
+                # Open the file with both pikepdf and pdfplumber in a single context
+                with Pdf.open(this_file_path) as src_pdf, pdfplumber.open(this_file_path) as plumber_pdf:
+                    # 1. Generate TOC entry
+                    toc_entry_params = TocEntryParams(
+                        item=(filename, index_data[filename]),
+                        page_counts=page_counts,
+                        pdf=src_pdf,
+                        tab_counts=tab_counts,
+                        section_counts=section_counts,
+                    )
+                    if entry := _generate_toc_entry(toc_entry_params):
+                        toc_entries.append(entry)
+
+                    # 2. Check for blank pages
+                    for page in plumber_pdf.pages:
+                        if _is_page_blank(page):
+                            bundle_logger.warning(f"Blank page detected in '{this_file_path.name}' on page {page.page_number}.")
+
+                    # 3. Get and adjust bookmarks
+                    sub_bookmarks = get_and_adjust_bookmarks(src_pdf, current_page_offset)
                     if sub_bookmarks:
-                        bundle_logger.debug(f"Found {len(sub_bookmarks)} sub-bookmarks in '{filename}'.")
-                        if not toc_entry:
-                            bundle_logger.warning(f"  - Could not find a parent TOC entry for '{filename}'. Sub-bookmarks will not be nested.")
-                            continue
-                        bundle_logger.debug(f"  - Parent TOC entry found: {toc_entry}")
-                        sub_bookmark_group = {
-                            "parent_title": toc_entry[1],
-                            "tab": toc_entry[0],
-                            "bookmarks": sub_bookmarks,
-                        }
-                        bundle_logger.debug("  - Created sub-bookmark group for nesting.")
-                        all_sub_bookmarks.append(sub_bookmark_group)
-                opened_pdfs.append(src_pdf)  # type: ignore
-                pdf.pages.extend(pages)
-                # Hyperlink adjustment for inner bundles is now handled later in `_adjust_inner_bundle_links`
+                        toc_entry = toc_entries[-1]  # The entry we just added
+                        all_sub_bookmarks.append({"parent_title": toc_entry[1], "tab": toc_entry[0], "bookmarks": sub_bookmarks})
 
-                current_page_offset += len(pages)
+                    # 4. Check if it's a bundle and store the result
+                    is_bundle_map[filename] = is_bundle(plumber_pdf)
+
+                    # 5. Append pages to the main document
+                    pdf.pages.extend(src_pdf.pages)
+                    current_page_offset += len(src_pdf.pages)
             else:
-                bundle_logger.warning(f"Could not get pages from {filename}. Skipping.")
+                bundle_logger.warning(f"File {filename} not found. Skipping.")
 
         pdf.save(output_file)
-        return toc_entries, all_sub_bookmarks
+        return toc_entries, all_sub_bookmarks, is_bundle_map, page_counts["total"]
     finally:
-        # Ensure all source PDFs are closed after we are done with their pages
-        for src in opened_pdfs:
-            src.close()
+        pass  # Files are closed within their `with` blocks or explicitly
 
 
 def _create_bookmark_item(entry, length_of_frontmatter, bundle_config: BundleConfig):
@@ -584,7 +556,7 @@ def _create_section_bookmark(entry, toc_entries, length_of_frontmatter):
     return OutlineItem(entry[1], destination_page)
 
 
-def add_bookmarks_to_pdf(pdf_file, output_file, toc_entries, length_of_frontmatter, bundle_config: BundleConfig):
+def add_bookmarks_to_pdf(pdf: Pdf, toc_entries: list, length_of_frontmatter: int, bundle_config: BundleConfig):
     """Add outline entries ('bookmarks') to a PDF for navigation..
 
     It reads the digested toc_entries and adds an outline item for each.
@@ -597,58 +569,51 @@ def add_bookmarks_to_pdf(pdf_file, output_file, toc_entries, length_of_frontmatt
         "tab-title-page"
         "tab-title-date-page
     """
-    with Pdf.open(pdf_file) as pdf:
-        with pdf.open_outline() as outline:
-            current_section_bookmark = None
-            main_bookmark_map = {}
+    with pdf.open_outline() as outline:
+        current_section_bookmark = None
+        main_bookmark_map = {}
 
-            for entry in toc_entries:
-                # Skip the header row if it's present in toc_entries
-                if "tab" in str(entry[0]).lower() and "title" in str(entry[1]).lower():
-                    continue
+        for entry in toc_entries:
+            # Skip the header row if it's present in toc_entries
+            if "tab" in str(entry[0]).lower() and "title" in str(entry[1]).lower():
+                continue
 
-                if "SECTION_BREAK" in entry[0]:
-                    current_section_bookmark = _create_section_bookmark(entry, toc_entries, length_of_frontmatter)
-                    outline.root.append(current_section_bookmark)
-                else:
-                    # This is a file entry.
-                    bookmark_item = _create_bookmark_item(entry, length_of_frontmatter, bundle_config)
-                    main_bookmark_map[bookmark_item.title] = bookmark_item
-                    if current_section_bookmark:
-                        current_section_bookmark.children.append(bookmark_item)
-                    else:
-                        outline.root.append(bookmark_item)
-
-            # Now, add the sub-bookmarks under their correct parent in the main TOC
-            _process_all_sub_bookmarks(main_bookmark_map, bundle_config.all_sub_bookmarks, length_of_frontmatter)
-
-        pdf.save(output_file)
-
-
-def bookmark_the_index(pdf_file, output_file, coversheet=None):
-    """The function add_bookmarks_to_pdf adds an outline item for each input file.
-
-    But it cannot bookmark the index itself because it takes place earlier in the
-    order of processing.
-    This function comes back for a second pass and adds an outline item for the
-    index.
-    """
-    with Pdf.open(pdf_file) as pdf:
-        with pdf.open_outline() as outline:
-            if coversheet:
-                # test length of coversheet and set coversheet_length to the number of pages:
-                with Pdf.open(coversheet) as coversheet_pdf:
-                    coversheet_length = len(coversheet_pdf.pages)
-                # Add an outline item for "Index" linking to the first page after the coversheet (it's 0-indexed):
-                index_item = OutlineItem("Index", coversheet_length)
-                outline.root.insert(0, index_item)
-                bundle_logger.debug("[BTI]coversheet is specified, outline item added for index")
+            if "SECTION_BREAK" in entry[0]:
+                current_section_bookmark = _create_section_bookmark(entry, toc_entries, length_of_frontmatter)
+                outline.root.append(current_section_bookmark)
             else:
-                # Add an outline item for "Index" linking to the first page:
-                index_item = OutlineItem("Index", 0)
-                outline.root.insert(0, index_item)
-                bundle_logger.debug("[BTI]no coversheet specified, outline item added for index")
-        pdf.save(output_file)
+                # This is a file entry.
+                bookmark_item = _create_bookmark_item(entry, length_of_frontmatter, bundle_config)
+                main_bookmark_map[bookmark_item.title] = bookmark_item
+                if current_section_bookmark:
+                    current_section_bookmark.children.append(bookmark_item)
+                else:
+                    outline.root.append(bookmark_item)
+
+        # Now, add the sub-bookmarks under their correct parent in the main TOC
+        _process_all_sub_bookmarks(main_bookmark_map, bundle_config.all_sub_bookmarks, length_of_frontmatter)
+
+
+def bookmark_the_index(pdf: Pdf, coversheet_path: Path | None = None):
+    """Adds an outline item for the index to an open PDF object."""
+    with pdf.open_outline() as outline:
+        coversheet_length = 0
+        if coversheet_path and coversheet_path.exists():
+            try:
+                with Pdf.open(coversheet_path) as coversheet_pdf:
+                    coversheet_length = len(coversheet_pdf.pages)
+            except Exception:
+                bundle_logger.exception(f"Could not open coversheet {coversheet_path} to get length for index bookmark.")
+
+        # Add an outline item for "Index" linking to the first page (or after the coversheet).
+        index_item = OutlineItem("Index", coversheet_length)
+        outline.root.insert(0, index_item)
+        log_msg = (
+            f"coversheet is specified, outline item added for index at page {coversheet_length}"
+            if coversheet_length > 0
+            else "no coversheet specified, outline item added for index at page 0"
+        )
+        bundle_logger.debug(f"[BTI]{log_msg}")
 
 
 def _get_toc_pdf_styles(date_setting, index_font_setting):
@@ -743,15 +708,16 @@ def _build_reportlab_table_data(table_data_params: TableDataParams):
     return reportlab_table_data, adjusted_section_breaks
 
 
-def _setup_reportlab_styles(main_font, bold_font, base_font_size):
+def _setup_reportlab_styles(main_font: str, bold_font: str, base_font_size: int):
     """Set up ParagraphStyle objects for ReportLab."""
     script_dir = Path(__file__).parent
     static_dir = script_dir / "static"
 
     # Register non-standard fonts.
-    pdfmetrics.registerFont(TTFont("Charter_regular", static_dir / "Charter_Regular.ttf"))
-    pdfmetrics.registerFont(TTFont("Charter_bold", static_dir / "Charter_Bold.ttf"))
-    pdfmetrics.registerFont(TTFont("Charter_italic", static_dir / "Charter_Italic.ttf"))
+    if not pdfmetrics.getFont(main_font):
+        pdfmetrics.registerFont(TTFont("Charter_regular", static_dir / "Charter_Regular.ttf"))
+        pdfmetrics.registerFont(TTFont("Charter_bold", static_dir / "Charter_Bold.ttf"))
+        pdfmetrics.registerFont(TTFont("Charter_italic", static_dir / "Charter_Italic.ttf"))
     reportlab.rl_config.warnOnMissingFontGlyphs = 0
 
     # Set up stylesheet for the various styles used..
@@ -830,7 +796,7 @@ def _setup_reportlab_styles(main_font, bold_font, base_font_size):
     return styleSheet
 
 
-def create_toc_pdf_reportlab(toc_entries, casedetails: dict[str, str], bundle_config: BundleConfig, output_file, options: dict):
+def create_toc_pdf_reportlab(toc_entries, casedetails: dict[str, str], bundle_config: BundleConfig, output_file, options: dict) -> int:
     """Generate a table of contents PDF using ReportLab."""
     styles = _get_toc_pdf_styles(options.get("date_setting"), bundle_config.index_font)
     main_font = styles["main_font"]
@@ -982,6 +948,8 @@ def create_toc_pdf_reportlab(toc_entries, casedetails: dict[str, str], bundle_co
     else:
         reportlab_pdf.build(elements)
 
+    return reportlab_pdf.page
+
 
 def generate_footer_pages_reportlab(filename, num_pages, bundle_config):
     """Generate a PDF with N blank pages, using onFirstPage and onLaterPages callbacks.
@@ -1117,41 +1085,32 @@ def _perform_overlay(content_pdf: Pdf, footer_pdf: Pdf):
         content_page.add_overlay(footer_page, None)
 
 
-def add_footer_to_bundle(input_file: Path, page_numbers_pdf_path: Path, output_file: Path):
+def add_footer_to_bundle(content_pdf: Pdf, page_numbers_pdf_path: Path):
     """Overlay a footer PDF onto a content PDF.
 
-    Given an input file (a series of pdfs merged together) and
-    a pdf of equal length containing only the page number footers,
-    this combines the two by overlaying footers on top of the input file.
-    This function now uses pikepdf for consistency and robustness.
+    This function operates on an open content_pdf object for efficiency.
+    It modifies the content_pdf in place and does not save it.
     """
     try:
-        with Pdf.open(input_file) as content_pdf, Pdf.open(page_numbers_pdf_path) as footer_pdf:
+        with Pdf.open(page_numbers_pdf_path) as footer_pdf:
             _perform_overlay(content_pdf, footer_pdf)
-            content_pdf.save(output_file)
     except Exception:
         bundle_logger.exception("[OPN]Error overlaying page numbers")
         raise
 
 
-def pdf_paginator_reportlab(input_file, bundle_config: BundleConfig, output_file):
-    """Drop-in replacement for tex alternative.
-
-    Calls sub-functions to create page numbers and add them to the bundle.
-    """
+def pdf_paginator_reportlab(pdf: Pdf, bundle_config: BundleConfig):
+    """Paginates an open PDF object in place."""
     bundle_logger.debug("[PPRL]Paginate PDF function beginning (ReporLab version)")
-    main_page_count = 0
-    try:
-        main_page_count = len(Pdf.open(input_file).pages)
-        bundle_logger.debug(f"[PPRL]..Main PDF has {main_page_count} pages")
-    except Exception:
-        bundle_logger.exception("[PPRL]..Error counting pages in TOC")
-        raise
-    page_numbers_pdf_path = Path(output_file).parent / "pageNumbers.pdf"
+    main_page_count = len(pdf.pages)
+    bundle_logger.debug(f"[PPRL]..Main PDF has {main_page_count} pages")
+
+    page_numbers_pdf_path = bundle_config.temp_dir / "pageNumbers.pdf"
     generate_footer_pages_reportlab(page_numbers_pdf_path, main_page_count, bundle_config)
+
     if Path(page_numbers_pdf_path).exists():
         try:
-            add_footer_to_bundle(input_file, page_numbers_pdf_path, output_file)
+            add_footer_to_bundle(pdf, page_numbers_pdf_path)
             bundle_logger.debug("[PPRL]Page numbers overlaid on main PDF")
         except Exception:
             bundle_logger.exception("[PPRL]Error overlaying page numbers")
@@ -1161,83 +1120,59 @@ def pdf_paginator_reportlab(input_file, bundle_config: BundleConfig, output_file
     return main_page_count
 
 
-def add_roman_labels(pdf_file, length_of_frontmatter, output_file):
-    """Adjust page numbering to begin with Roman numerals for the frontmatter.
-
-    This begins with page 1 on the first page of the main
-    content.
-    The elegant solution which is so often messed up that nobody wants to
-    go near it any more.
-    """
-    bundle_logger.debug(f"[APL]Adding page labels to PDF {pdf_file}")
-    with Pdf.open(pdf_file) as pdf:
-        nums = [
-            0,
-            Dictionary(S=Name("/r")),  # lowercase Roman starting at first page of bundle
-            length_of_frontmatter,
-            Dictionary(S=Name("/D")),  # Decimal starting at page 1 after frontmatter
-        ]
-
-        pdf.Root.PageLabels = Dictionary(Nums=nums)
-        pdf.save(output_file)
+def add_roman_labels(pdf: Pdf, length_of_frontmatter: int):
+    """Adjust page numbering to begin with Roman numerals for the frontmatter."""
+    bundle_logger.debug(f"[APL]Adding page labels to PDF {pdf.filename}")
+    # Page labels are a list of dictionaries.
+    # See PDF 32000-1:2008, 12.4.2 Number Trees
+    pdf.Root.PageLabels = Dictionary(Nums=[0, Dictionary(S=Name.r), length_of_frontmatter, Dictionary(S=Name.D, St=1)])
 
 
 def transform_coordinates(coords, page_height):
     """Transform coordinates from top-left to bottom-left origin system."""
     x1, y1, x2, y2 = coords
-    # Flip the y coordinates by subtracting from page height
+    # Flip the y coordinates by subtracting from page height. Ensure consistent types.
     new_y1 = page_height - y2  # Note: we swap y1 and y2 here
     new_y2 = page_height - y1
     return (x1, new_y1, x2, new_y2)
 
 
-def add_annotations_with_transform(pdf_file, list_of_annotation_coords, output_file):
-    """Write hyperlinks into the output bundle PDF.
+def add_annotations_with_transform(pdf: Pdf, list_of_annotation_coords: list):
+    """Write hyperlinks into an open pikepdf.Pdf object."""
+    # For efficiency, group annotations by the page they belong to.
+    # First, sort the annotations by 'toc_page' index.
+    sorted_annotations = sorted(list_of_annotation_coords, key=lambda x: x["toc_page"])
 
-    hyperlinks into the output bundle PDF.
-    It's only called as a subprocess of add_hyperlinks.
-    """
-    reader = PdfReader(pdf_file)
-    writer = PdfWriter()
-
-    # Copy all pages to the writer
-    for page in reader.pages:
-        writer.add_page(page)
-
-    # navigate the treacherous PDF coordinate system
-    for annotation in list_of_annotation_coords:
-        toc_page = annotation["toc_page"]
-        coords = annotation["coords"]
-        destination_page = annotation["destination_page"]
-
-        # Get the page height for coordinate transformation
-        page = reader.pages[toc_page]
-        page_height = float(page.mediabox.height)
-
-        # Transform the coordinates
-        transformed_coords = transform_coordinates(coords, page_height)
-
+    # Group by 'toc_page' and process each group.
+    for toc_page_idx, annotation_group_iter in groupby(sorted_annotations, key=lambda x: x["toc_page"]):
         try:
-            # Create link annotation with transformed coordinates
-            link = Link(rect=transformed_coords, target_page_index=destination_page)
-            writer.add_annotation(page_number=toc_page, annotation=link)
+            toc_page = pdf.pages[toc_page_idx]
+            page_height = float(toc_page.mediabox[3])  # Convert Decimal to float for compatibility
+            # Convert the groupby iterator to a list to allow multiple uses.
+            annotation_group = list(annotation_group_iter)
 
-            # # Create highlight annotation with transformed coordinates
-            # quad_points = [
-            #     transformed_coords[0], transformed_coords[3],  # x1, y1 (top left)
-            #     transformed_coords[2], transformed_coords[3],  # x2, y1 (top right)
-            #     transformed_coords[0], transformed_coords[1],  # x1, y2 (bottom left)
-            #     transformed_coords[2], transformed_coords[1]   # x2, y2 (bottom right)
-            # ]
-            bundle_logger.debug(f"[AAWT]Added annotations on TOC page {toc_page} to destination pg index {destination_page}")
+            # Ensure the Annots array exists on the page
+            if "/Annots" not in toc_page:
+                toc_page.Annots = Array()
+
+            # Create and append all annotations for this page
+            # using a generator expression inside extend.
+            toc_page.Annots.extend(
+                Dictionary(
+                    Type=Name.Annot,
+                    Subtype=Name.Link,
+                    Rect=Rectangle(*transform_coordinates(details["coords"], page_height)),
+                    Border=[0, 0, 0],
+                    Dest=[pdf.pages[details["destination_page"]].obj, Name.Fit],
+                )
+                for details in annotation_group
+            )
+
+            bundle_logger.debug(f"[AAWT]Added {len(annotation_group)} annotations to TOC page {toc_page_idx}")
 
         except Exception:
-            bundle_logger.exception(f"[AAWT]Failed to add annotations on TOC page {toc_page}")
+            bundle_logger.exception(f"[AAWT]Failed to add annotation on TOC page {toc_page_idx}")
             raise
-
-    # Write the output file
-    with Path(output_file).open("wb") as output:
-        writer.write(output)
 
 
 def get_scraped_pages_text(pdf: PDF, idx: int):
@@ -1265,39 +1200,6 @@ def _find_match_for_entry(entry, scraped_pages_text, length_of_coversheet, lengt
                 }
     bundle_logger.warning(f"[HYP]......FAILURE: No match found for tab '{tab_to_find}'")
     return None
-
-
-def add_hyperlinks(pdf_file, output_file, length_of_coversheet, length_of_frontmatter, toc_entries):
-    """Add Hyperlinks to the table of contents pages.
-
-    The PDF standard defines these as
-    rectangular areas with an action to jump to a destination within the document.
-
-    This means we need to know the coordinates of the rectangles. That is the main
-    job of this function: to find rectangle coordinates.
-
-    Strategy:
-    - extract the text of the toc pages into a list of words with coordinates.
-    - create a search string for each intended hyperlink entry (a melange of the expected tab, title, page).
-    - truncate the string to account for line breaks and noise.
-    - find that search string in the extracted text; thus, find the coordinates on the page.
-    - pass off to the annotation writer for actual writing.
-    """
-    bundle_logger.debug("[HYP]Starting hyperlink addition")
-
-    # Step 1: Extract text and coordinates from TOC
-    with pdfplumber.open(pdf_file) as pdf:
-        scraped_pages_text = [get_scraped_pages_text(pdf, idx) for idx in range(length_of_coversheet, length_of_frontmatter)]
-
-    list_of_annotation_coords = [
-        match
-        for entry in toc_entries
-        if "SECTION_BREAK" not in entry[0] and not (len(entry) > MIN_TOC_ENTRY_FIELDS and str(entry[3]) == "Page")
-        if (match := _find_match_for_entry(entry, scraped_pages_text, length_of_coversheet, length_of_frontmatter))
-    ]
-
-    # Step 3: Add annotations to the PDF
-    add_annotations_with_transform(pdf_file, list_of_annotation_coords, output_file)
 
 
 def _initialize_bundle_creation(bundle_config_data: BundleConfig, output_file, coversheet, input_files, index_file):
@@ -1360,25 +1262,19 @@ def _process_index_and_merge(bundle_config: BundleConfig, index_file, temp_path:
         ....index_data: {index_data}"""
     dedent_and_log(bundle_logger, log_msg)
     try:
-        toc_entries, all_sub_bookmarks = merge_pdfs_create_toc_entries(input_files, merged_file, index_data)
+        toc_entries, all_sub_bookmarks, is_bundle_map, main_page_count = merge_pdfs_create_toc_entries(input_files, merged_file, index_data)
     except Exception:
         bundle_logger.exception("[CB]Error while merging pdf files")
         raise
     else:
         if not Path(merged_file).exists():
             bundle_logger.info(f"[CB]Merging file unsuccessful: cannot locate expected ouput {merged_file}.")
-            return None, None, [], None
+            return None, None, None, None, None
 
         bundle_logger.info(f"[CB]Merged PDF created at {merged_file}")
     bundle_config.all_sub_bookmarks = all_sub_bookmarks
     # list out settings in a human-readable way for remote user support.
-    file_details = "\n".join(
-        f'            ..File {idx + 1}: Filename "{secure_filename(file.name)}"\n'
-        f"            .... had index data: {file.name in index_data}\n"
-        f"            .... had {len(Pdf.open(file).pages)} page(s)."
-        for idx, file in enumerate(input_files)
-    )
-
+    # The file_details log has been removed as it was inefficiently opening files.
     user_settings_log = f"""\
         =============================================================================
         BUNTOOL -- BEGIN RECORD OF USER SETTINGS
@@ -1388,7 +1284,6 @@ def _process_index_and_merge(bundle_config: BundleConfig, index_file, temp_path:
         ..Case Name: {bundle_config.case_details.get("case_name", "")}
         ..Claim Number: {bundle_config.case_details.get("claim_no", "")}
         STEP TWO:
-        {file_details}
         STEP THREE:
         ..Index Options:
         ....Index font: {bundle_config.index_font}
@@ -1405,10 +1300,8 @@ def _process_index_and_merge(bundle_config: BundleConfig, index_file, temp_path:
         ================================================================================="""
     dedent_and_log(bundle_logger, user_settings_log)
 
-    with Pdf.open(merged_file) as mergedfile:
-        main_page_count = len(mergedfile.pages)
-    bundle_config.main_page_count = main_page_count  # main page count for x of y pagination if needed
-    return index_data, toc_entries, [merged_file], main_page_count
+    bundle_config.main_page_count = main_page_count
+    return index_data, toc_entries, merged_file, main_page_count, is_bundle_map
 
 
 def _create_front_matter(bundle_config, coversheet, coversheet_path, temp_path: Path, toc_entries):
@@ -1430,7 +1323,9 @@ def _create_front_matter(bundle_config, coversheet, coversheet_path, temp_path: 
         try:
             dummy_toc_pdf_path = temp_path / "TEMP02_dummy_toc.pdf"
             options = {"confidential": bundle_config.confidential_bool, "date_setting": bundle_config.date_setting, "dummy": True}
-            create_toc_pdf_reportlab(toc_entries, bundle_config.case_details, bundle_config, dummy_toc_pdf_path, options)  # DUMMY TOC)
+            length_of_dummy_toc = create_toc_pdf_reportlab(
+                toc_entries, bundle_config.case_details, bundle_config, dummy_toc_pdf_path, options
+            )  # DUMMY TOC)
         except Exception:
             bundle_logger.exception("[CB]Error during first pass TOC creation")
             raise
@@ -1438,19 +1333,8 @@ def _create_front_matter(bundle_config, coversheet, coversheet_path, temp_path: 
             bundle_logger.error(f"[CB]First pass TOC file unsuccessful: cannot locate expected ouput {dummy_toc_pdf_path}.")
             return None, None, None, []
         bundle_logger.info(f"[CB]dummy TOC PDF created at {dummy_toc_pdf_path}")
-        tempdir_path = temp_path
-        temp_files.extend(
-            [
-                dummy_toc_pdf_path,
-                tempdir_path / "dummytoc.out",
-                tempdir_path / "TEMP02_dummy_toc.aux",
-                tempdir_path / "dummytoc.tex",
-            ]
-        )
-        # find length of dummy TOC:
-        with Pdf.open(dummy_toc_pdf_path) as dummytocpdf:
-            length_of_dummy_toc = len(dummytocpdf.pages)
-            expected_length_of_frontmatter = length_of_coversheet + length_of_dummy_toc
+        temp_files.append(dummy_toc_pdf_path)
+        expected_length_of_frontmatter = length_of_coversheet + length_of_dummy_toc
     else:
         expected_length_of_frontmatter = length_of_coversheet
 
@@ -1499,7 +1383,9 @@ def _create_toc(toc_params: TocParams):
         "dummy": False,
         "roman_numbering": bundle_config.roman_for_preface,
     }
-    create_toc_pdf_reportlab(toc_entries, bundle_config.case_details, bundle_config=bundle_config, output_file=toc_file_path, options=options)
+    length_of_toc = create_toc_pdf_reportlab(
+        toc_entries, bundle_config.case_details, bundle_config=bundle_config, output_file=toc_file_path, options=options
+    )
     if not Path(toc_file_path).exists():
         raise CreateTocError()
 
@@ -1519,7 +1405,7 @@ def _create_toc(toc_params: TocParams):
         create_toc_docx(toc_entries, case_details_list, docx_output_path, docx_config)
     except Exception:
         bundle_logger.exception("[CB]..Error during create_toc_docx")
-    return docx_output_path
+    return docx_output_path, length_of_toc
 
 
 class BundleLastLegParams(NamedTuple):
@@ -1558,42 +1444,35 @@ class PageLabelsError(Exception):
         super().__init__(f"Page labels process failed: {option}")
 
 
-def _adjust_inner_bundle_links(pdf_path: Path, bundle_config: BundleConfig, toc_entries: list, index_data: dict, length_of_frontmatter: int):
+def _adjust_inner_bundle_links(pdf: Pdf, toc_entries: list, index_data: dict, length_of_frontmatter: int, is_bundle_map: dict):
     """Adjusts the hyperlink destinations within any nested bundles in the final PDF."""
-    bundle_logger.debug(f"Adjusting inner bundle links for {pdf_path.name} with final frontmatter length {length_of_frontmatter}")
-    with Pdf.open(pdf_path, allow_overwriting_input=True) as pdf:
-        # Create a map from original filename to its starting page in the main content
-        filename_to_start_page = {
-            index_data_filename: entry[3]
-            for entry in toc_entries
-            if "SECTION_BREAK" not in entry[0] and len(entry) > MIN_TOC_ENTRY_FIELDS
-            for index_data_filename, index_data_entry in index_data.items()
-            if index_data_entry[0] == entry[1]
-        }
+    bundle_logger.debug(f"Adjusting inner bundle links for {pdf.filename} with final frontmatter length {length_of_frontmatter}")
+    # Create a map from original filename to its starting page in the main content
+    filename_to_start_page = {
+        index_data_filename: entry[3]
+        for entry in toc_entries
+        if "SECTION_BREAK" not in entry[0] and len(entry) > MIN_TOC_ENTRY_FIELDS
+        for index_data_filename, index_data_entry in index_data.items()
+        if index_data_entry[0] == entry[1]
+    }
 
-        for filename, start_page_in_main_content in filename_to_start_page.items():
-            src_path = bundle_config.temp_dir / filename
-            if not src_path.exists():
-                continue
+    for filename, start_page_in_main_content in filename_to_start_page.items():
+        num_toc_pages = is_bundle_map.get(filename, 0)
+        if num_toc_pages > 0:
+            # This is a nested bundle. Adjust its links.
+            # The final start page of this inner bundle's content in the assembled PDF.
+            final_start_page = start_page_in_main_content + length_of_frontmatter
+            bundle_logger.debug(
+                f"Found inner bundle '{filename}' starting at final page {final_start_page}. Adjusting its {num_toc_pages} TOC pages."
+            )
 
-            with Pdf.open(src_path) as src_pdf:
-                num_toc_pages = is_bundle(src_pdf)
-                if num_toc_pages > 0:
-                    # This is a nested bundle. Adjust its links.
-                    # The final start page of this inner bundle's content in the assembled PDF.
-                    final_start_page = start_page_in_main_content + length_of_frontmatter
-                    bundle_logger.debug(
-                        f"Found inner bundle '{filename}' starting at final page {final_start_page}. Adjusting its {num_toc_pages} TOC pages."
-                    )
-
-                    # The links are on the TOC pages of the inner bundle.
-                    # These pages are located at the beginning of where the inner bundle was placed.
-                    for i in range(num_toc_pages):
-                        page_to_adjust = pdf.pages[final_start_page + i]
-                        for annot in page_to_adjust.get("/Annots", []):
-                            if annot.get("/Subtype") == "/Link" and annot.Dest:
-                                annot.Dest[0] += final_start_page
-        pdf.save()
+            # The links are on the TOC pages of the inner bundle.
+            # These pages are located at the beginning of where the inner bundle was placed.
+            for i in range(num_toc_pages):
+                page_to_adjust = pdf.pages[final_start_page + i]
+                for annot in page_to_adjust.get("/Annots", []):
+                    if annot.get("/Subtype") == "/Link" and annot.Dest:
+                        annot.Dest[0] += final_start_page
 
 
 def bundle_last_leg(bundle_last_leg_params: BundleLastLegParams):
@@ -1625,37 +1504,10 @@ def bundle_last_leg(bundle_last_leg_params: BundleLastLegParams):
         ......date_setting: {bundle_config.date_setting},
         ......roman_for_preface: {bundle_config.roman_for_preface}"""
     dedent_and_log(bundle_logger, log_msg)
-    try:
-        add_hyperlinks(
-            merged_file_with_frontmatter,
-            hyperlinked_file,
-            length_of_coversheet if length_of_coversheet is not None else 0,
-            length_of_frontmatter,
-            toc_entries,
-        )
-    except Exception as e:
-        raise HyperlinkingError("A", "[CB]..Error during add_hyperlinks") from e
-    if not Path(hyperlinked_file).exists():
-        raise HyperlinkingError("B", f"[CB]..Hyperlinking file unsuccessful: cannot locate expected ouput {hyperlinked_file}.")
 
     log_msg = """
-    [CB]Adjusting inner bundle links..."""
+    [CB]Adjusting inner bundle links and adding bookmarks..."""
     dedent_and_log(bundle_logger, log_msg)
-    _adjust_inner_bundle_links(hyperlinked_file, bundle_config, toc_entries, index_data, length_of_frontmatter)
-
-    log_msg = f"""
-    [CB]Calling add_bookmarks_to_pdf [AB] with arguments:
-    ....hyperlinked_file: {hyperlinked_file}
-    ....main_bookmarked_file: {main_bookmarked_file}
-    ....toc_entries: {toc_entries}
-    ....length_of_frontmatter: {length_of_frontmatter}"""
-    dedent_and_log(bundle_logger, log_msg)
-    try:
-        add_bookmarks_to_pdf(hyperlinked_file, main_bookmarked_file, toc_entries, length_of_frontmatter, bundle_config)
-    except Exception as e:
-        raise BookmarkingError("A", "[CB]..Error during add_bookmarks_to_pdf") from e
-    if not Path(main_bookmarked_file).exists():
-        raise BookmarkingError("B", f"[CB]..Bookmarking file unsuccessful: cannot locate expected ouput {main_bookmarked_file}.")
 
     log_msg = f"""
         [CB]Calling bookmark_the_index [BI] with arguments:
@@ -1664,28 +1516,24 @@ def bundle_last_leg(bundle_last_leg_params: BundleLastLegParams):
         ....coversheet_path: {coversheet_path}"""
     dedent_and_log(bundle_logger, log_msg)
     try:
-        bookmark_the_index(main_bookmarked_file, index_bookmarked_file, coversheet_path)
+        shutil.copy(hyperlinked_file, index_bookmarked_file)
+        try:
+            with Pdf.open(index_bookmarked_file, allow_overwriting_input=True) as pdf:
+                add_roman_labels(pdf, length_of_frontmatter)
+                pdf.save(tmp_output_file)
+        except Exception as e:
+            raise PageLabelsError("A", "[CB]..Error during add_roman_labels") from e
     except Exception as e:
         raise BookmarkingError("C", "[CB]..Error during bookmark_the_index") from e
     if not Path(index_bookmarked_file).exists():
         raise BookmarkingError("D", f"[CB]..Bookmarking index file unsuccessful: cannot locate expected ouput {index_bookmarked_file}.")
 
     if bundle_config.roman_for_preface:
-        log_msg = f"""
-            [CB]Calling add_roman_labels [APL] with arguments:
-            ....index_bookmarked_file: {index_bookmarked_file}
-            ....frontmatter_path: {frontmatter_path}
-            ....tmp_output_file: {tmp_output_file}"""
-        dedent_and_log(bundle_logger, log_msg)
-        try:
-            add_roman_labels(index_bookmarked_file, length_of_frontmatter, tmp_output_file)
-        except Exception as e:
-            raise PageLabelsError("A", "[CB]..Error during add_roman_labels") from e
         if not Path(tmp_output_file).exists():
             raise PageLabelsError("B", f"[CB]..Adding page labels unsuccessful: cannot locate expected ouput {tmp_output_file}.")
         bundle_logger.info(f"[CB]..Page labels added to PDF saved to {tmp_output_file}")
     else:
-        shutil.copyfile(index_bookmarked_file, tmp_output_file)
+        shutil.copy(index_bookmarked_file, tmp_output_file)
 
     bundle_logger.info(f"[CB]Completed bundle creation. output written to: {tmp_output_file}")
 
@@ -1771,17 +1619,15 @@ def paginate_merged_main_files(merged_file, merged_paginated_no_toc, bundle_conf
         ....page_numbering_style: {bundle_config.page_num_style}
         ....footer_prefix: {bundle_config.footer_prefix}"""
     dedent_and_log(bundle_logger, log_msg)
-    try:
-        paginated_page_count = pdf_paginator_reportlab(merged_file, bundle_config, merged_paginated_no_toc)
-    except Exception as e:
-        bundle_logger.exception("[CB]..Error during pdf_paginator_reportlab")
-        paginated_page_count = 0
-        raise PaginationError("A") from e
-    if not Path(merged_paginated_no_toc).exists():
-        bundle_logger.error(f"[CB]..Paginating file unsuccessful: cannot locate expected ouput {merged_paginated_no_toc}.")
-        raise PaginationError("B")
-    if paginated_page_count != bundle_config.main_page_count:
-        bundle_logger.warning(f"Pagination count mismatch: expected {bundle_config.main_page_count}, but got {paginated_page_count}. Continuing.")
+    with Pdf.open(merged_file, allow_overwriting_input=True) as pdf:
+        paginated_page_count = pdf_paginator_reportlab(pdf, bundle_config)
+        if paginated_page_count != bundle_config.main_page_count:
+            bundle_logger.warning(
+                f"Pagination count mismatch: expected {bundle_config.main_page_count}, but got {paginated_page_count}. Continuing."
+            )
+        pdf.save(merged_paginated_no_toc)
+
+    return merged_paginated_no_toc
 
 
 class FrontMatterError(Exception):
@@ -1804,7 +1650,7 @@ class SaveMergedFilesWithFrontmasterParams(NamedTuple):
     merged_file_with_frontmatter: Path
 
 
-def save_merged_files_with_frontmaster(get_front_matter_path_params: SaveMergedFilesWithFrontmasterParams):
+def save_merged_files_with_frontmaster(params: SaveMergedFilesWithFrontmasterParams):
     (
         temp_path,
         toc_file_path,
@@ -1815,7 +1661,7 @@ def save_merged_files_with_frontmaster(get_front_matter_path_params: SaveMergedF
         length_of_dummy_toc,
         merged_paginated_no_toc,
         merged_file_with_frontmatter,
-    ) = get_front_matter_path_params
+    ) = params
 
     frontmatter = temp_path / "TEMP00-coversheet-plus-toc.pdf"
     if coversheet:
@@ -1849,28 +1695,26 @@ def save_merged_files_with_frontmaster(get_front_matter_path_params: SaveMergedF
         frontmatter_path = toc_file_path
         bundle_logger.info("[CB]No coversheet specified. TOC is the only frontmatter.")
 
-    with Pdf.open(frontmatter_path) as frontmatter_pdf:
-        length_of_frontmatter = len(frontmatter_pdf.pages)
-        bundle_logger.debug(f"[CB]Frontmatter length is {length_of_frontmatter} pages.")
-        if not bundle_config.roman_for_preface:
-            if length_of_frontmatter != expected_length_of_frontmatter:
-                error_msg = f"[CB]..Frontmatter length mismatch: expected {length_of_frontmatter} pages, got {expected_length_of_frontmatter}."
-                raise FrontMatterError("C", error_msg)
-            bundle_logger.info(f"[CB]..Frontmatter length matches expected {length_of_dummy_toc} pages.")
+    # The length of the frontmatter is now known without opening the file
+    length_of_frontmatter = bundle_config.expected_length_of_frontmatter
+    bundle_logger.debug(f"[CB]Frontmatter length is {length_of_frontmatter} pages.")
+    if not bundle_config.roman_for_preface:
+        if length_of_frontmatter != expected_length_of_frontmatter:
+            error_msg = f"[CB]..Frontmatter length mismatch: expected {length_of_frontmatter} pages, got {expected_length_of_frontmatter}."
+            raise FrontMatterError("C", error_msg)
+        bundle_logger.info(f"[CB]..Frontmatter length matches expected {length_of_dummy_toc} pages.")
 
-    with Pdf.open(frontmatter_path) as frontmatter_pdf, Pdf.open(merged_paginated_no_toc) as main_pdf:
-        merged_pdf = Pdf.new()
-        merged_pdf.pages.extend(frontmatter_pdf.pages)
-        merged_pdf.pages.extend(main_pdf.pages)
-        merged_pdf.save(merged_file_with_frontmatter)
-    if not Path(merged_file_with_frontmatter).exists():
-        bundle_logger.exception(
-            f"[CB]..Merging frontmatter with main docs unsuccessful: cannot locate expected ouput {merged_file_with_frontmatter}."
-        )
-        raise FrontMatterError(
-            "D", f"[CB]..Merging frontmatter with main docs unsuccessful: cannot locate expected ouput {merged_file_with_frontmatter}."
-        )
-    bundle_logger.info(f"[CB]..Merged frontmatter with main docs at {merged_file_with_frontmatter}")
+    # Prepend the frontmatter to the main (paginated) PDF object in memory
+    with Pdf.open(merged_paginated_no_toc, allow_overwriting_input=True) as main_pdf, Pdf.open(frontmatter_path) as frontmatter_pdf:
+        # The `insert` method only takes one page at a time.
+        # To prepend multiple pages, we can use `extend` on a new list.
+        final_pages = list(frontmatter_pdf.pages)
+        final_pages.extend(main_pdf.pages)
+        del main_pdf.pages[:]
+        main_pdf.pages.extend(final_pages)
+        main_pdf.save(merged_file_with_frontmatter)
+
+    bundle_logger.info(f"[CB]..Saved merged PDF with frontmatter to {merged_file_with_frontmatter}")
     return frontmatter_path, length_of_frontmatter
 
 
@@ -1911,8 +1755,8 @@ def _assemble_final_bundle(
     ) = get_paths(temp_path)
 
     try:
-        paginate_merged_main_files(merged_file, merged_paginated_no_toc, bundle_config)
-        docx_output_path = _create_toc(
+        paginated_pdf = paginate_merged_main_files(merged_file, merged_paginated_no_toc, bundle_config)
+        docx_output_path, length_of_toc = _create_toc(
             TocParams(bundle_config, temp_path, toc_entries, length_of_coversheet, expected_length_of_frontmatter, toc_file_path)
         )
     except Exception as e:
@@ -1922,6 +1766,7 @@ def _assemble_final_bundle(
             bundle_logger.exception("[CB]..paginate_merged_main_files failed.")
         return None
 
+    bundle_config.expected_length_of_frontmatter = (length_of_coversheet or 0) + length_of_toc
     try:
         frontmatter_path, length_of_frontmatter = save_merged_files_with_frontmaster(
             SaveMergedFilesWithFrontmasterParams(
@@ -1931,8 +1776,8 @@ def _assemble_final_bundle(
                 coversheet_path,
                 bundle_config,
                 expected_length_of_frontmatter,
-                length_of_dummy_toc,
-                merged_paginated_no_toc,
+                length_of_toc,
+                paginated_pdf,
                 merged_file_with_frontmatter,
             )
         )
@@ -1940,24 +1785,34 @@ def _assemble_final_bundle(
         bundle_logger.exception("CB..Saving merged files with frontmatter failed.")
         return None
 
-    try:
-        bundle_last_leg(
-            BundleLastLegParams(
-                merged_file_with_frontmatter=merged_file_with_frontmatter,
-                length_of_coversheet=length_of_coversheet,
-                bundle_config=bundle_config,
-                temp_dir=temp_path,
-                hyperlinked_file=hyperlinked_file,
-                main_bookmarked_file=main_bookmarked_file,
-                index_bookmarked_file=index_bookmarked_file,
-                coversheet_path=coversheet_path,
-                frontmatter_path=frontmatter_path,
-                length_of_frontmatter=length_of_frontmatter,
-                toc_entries=toc_entries,
-                tmp_output_file=tmp_output_file,
-                index_data=index_data,
+    # Calculate hyperlink coordinates before opening the PDF for modification
+    bundle_logger.debug("[HYP]Starting hyperlink coordinate calculation")
+    with pdfplumber.open(merged_file_with_frontmatter) as pdf:
+        scraped_pages_text = [
+            get_scraped_pages_text(pdf, idx) for idx in range(length_of_coversheet if length_of_coversheet is not None else 0, length_of_frontmatter)
+        ]
+
+    list_of_annotation_coords = [
+        match
+        for entry in toc_entries
+        if "SECTION_BREAK" not in entry[0] and not (len(entry) > MIN_TOC_ENTRY_FIELDS and str(entry[3]) == "Page")
+        if (
+            match := _find_match_for_entry(
+                entry, scraped_pages_text, length_of_coversheet if length_of_coversheet is not None else 0, length_of_frontmatter
             )
         )
+    ]
+
+    try:
+        with Pdf.open(merged_file_with_frontmatter, allow_overwriting_input=True) as pdf:
+            add_annotations_with_transform(pdf, list_of_annotation_coords)
+            _adjust_inner_bundle_links(pdf, toc_entries, index_data, length_of_frontmatter, bundle_config.is_bundle_map)
+            add_bookmarks_to_pdf(pdf, toc_entries, length_of_frontmatter, bundle_config)
+            bookmark_the_index(pdf, coversheet_path)
+            if bundle_config.roman_for_preface:
+                add_roman_labels(pdf, length_of_frontmatter)
+            pdf.save(tmp_output_file)
+
     except Exception as e:
         if isinstance(e, HyperlinkingError):
             bundle_logger.exception("[CB]..Hyperlinking process failed.")
@@ -1995,8 +1850,11 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
     )
 
     try:
-        index_data, toc_entries, merge_temp_files, main_page_count = _process_index_and_merge(bundle_config, index_file, temp_path, input_files)
-        if not merge_temp_files:
+        index_data, toc_entries, merged_file_path, main_page_count, is_bundle_map = _process_index_and_merge(
+            bundle_config, index_file, temp_path, input_files
+        )
+        if not merged_file_path:
+            bundle_logger.error("Merging process failed, merged_file is None.")
             return None, None
 
         index_data = index_data or {}
@@ -2009,12 +1867,13 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
         if toc_entries is None:
             bundle_logger.error("[CB]toc_entries is None, cannot assemble bundle.")
             return None, None
+        bundle_config.is_bundle_map = is_bundle_map or {}
 
         result = _assemble_final_bundle(
             AssembleFinalBundleParams(
                 bundle_config=bundle_config,
                 temp_path=temp_path,
-                merged_file=merge_temp_files[0],
+                merged_file=merged_file_path,
                 expected_length_of_frontmatter=expected_length_of_frontmatter,
                 toc_entries=toc_entries,
                 index_data=index_data,
@@ -2031,7 +1890,7 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
         docx_output_path, final_bundle_temp_files = result
 
         # Combine all temporary files at the end
-        created_temp_files = merge_temp_files + (frontmatter_temp_files or []) + (final_bundle_temp_files or [])
+        created_temp_files = [merged_file_path] + (frontmatter_temp_files or []) + (final_bundle_temp_files or [])
 
     except Exception:
         bundle_logger.exception("[CB]Error during create_bundle")
@@ -2069,9 +1928,10 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
             bundle_logger.info(f"[CB]..Zip file created at {Path(zip_filepath).name}")
 
     # Final check of bookmarks in the output file for debugging
-    bundle_logger.info("=" * 20 + " FINAL BOOKMARK CHECK " + "=" * 20)
-    get_bookmarks(Path(tmp_output_file))
-    bundle_logger.info("=" * 20 + " END FINAL BOOKMARK CHECK " + "=" * 20)
+    with Pdf.open(tmp_output_file) as final_pdf:
+        bundle_logger.info("=" * 20 + " FINAL BOOKMARK CHECK " + "=" * 20)
+        get_bookmarks(final_pdf)
+        bundle_logger.info("=" * 20 + " END FINAL BOOKMARK CHECK " + "=" * 20)
 
     list_of_temp_files = initial_temp_files + created_temp_files
     remaining_files = remove_temporary_files(list_of_temp_files)
