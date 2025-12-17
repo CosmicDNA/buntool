@@ -340,6 +340,15 @@ def get_pages(input_files, filename) -> tuple[Pdf, list[Page]] | tuple[None, lis
     return None, []
 
 
+def _is_page_blank(page: PlumberPage) -> bool:
+    """Check if a pdfplumber page is blank (no text, images, or drawings)."""
+    has_text = page.extract_text(x_tolerance=2, y_tolerance=2)
+    has_images = bool(page.images)
+    has_drawings = bool(page.rects or page.curves or page.lines)
+    is_blank = not (has_text or has_images or has_drawings)
+    return is_blank
+
+
 def get_and_adjust_bookmarks(path: Path, page_offset: int) -> list[tuple[str, int, int]]:
     """Reads a PDF's bookmarks, adjusts their page destinations by an offset.
 
@@ -465,6 +474,11 @@ def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
             if src_pdf:
                 this_file_path = next((path for path in input_files if path.name == Path(filename).name), None)
                 if this_file_path:
+                    # Check for blank pages
+                    with pdfplumber.open(this_file_path) as plumber_pdf:
+                        for page in plumber_pdf.pages:
+                            if _is_page_blank(page):
+                                bundle_logger.warning(f"Blank page detected in '{this_file_path.name}' on page {page.page_number}.")
                     sub_bookmarks = get_and_adjust_bookmarks(this_file_path, current_page_offset)
                     if sub_bookmarks:
                         bundle_logger.debug(f"Found {len(sub_bookmarks)} sub-bookmarks in '{filename}'.")
@@ -945,12 +959,25 @@ def create_toc_pdf_reportlab(toc_entries, casedetails: dict[str, str], bundle_co
 
     # Now, build the pdf:
     elements = [claimno_table, header_table, Spacer(1, 1 * cm), toc_table]
+
+    def _get_coversheet_length(coversheet_path: Path) -> int:
+        """Safely get the number of pages in a coversheet PDF."""
+        if not coversheet_path.exists():
+            return 0
+        try:
+            with Pdf.open(coversheet_path) as coversheet_pdf:
+                return len(coversheet_pdf.pages)
+        except Exception:
+            bundle_logger.exception(f"Could not open coversheet at {coversheet_path} to determine length.")
+            return 0
+
+    def _create_toc_footer_config(bundle_config: BundleConfig) -> functools.partial:
+        """Creates a partial function for the TOC footer with the correct page offset."""
+        length_of_coversheet = _get_coversheet_length(bundle_config.temp_dir / "coversheet.pdf")
+        return functools.partial(reportlab_footer_config, bundle_config=bundle_config, page_offset_override=length_of_coversheet)
+
     if not options.get("roman_numbering"):
-        # When creating the TOC, the page number offset should only be the coversheet length.
-        length_of_coversheet = (
-            len(Pdf.open(bundle_config.temp_dir / "coversheet.pdf").pages) if (bundle_config.temp_dir / "coversheet.pdf").exists() else 0
-        )
-        toc_footer_config = functools.partial(reportlab_footer_config, bundle_config=bundle_config, page_offset_override=length_of_coversheet)
+        toc_footer_config = _create_toc_footer_config(bundle_config)
         reportlab_pdf.build(elements, onFirstPage=toc_footer_config, onLaterPages=toc_footer_config)
     else:
         reportlab_pdf.build(elements)
@@ -1075,44 +1102,33 @@ def reportlab_footer_config(canvas: Canvas, _doc, bundle_config: BundleConfig, p
     canvas.restoreState()
 
 
-def add_footer_to_bundle(input_file, page_numbers_pdf_path, output_file):
+def _perform_overlay(content_pdf: Pdf, footer_pdf: Pdf):
+    """Check page counts and overlay footer pages onto content pages."""
+    if len(content_pdf.pages) != len(footer_pdf.pages):
+        msg = f"Page counts do not match: input={len(content_pdf.pages)} vs page numbers={len(footer_pdf.pages)}"
+        bundle_logger.error("[OPN]Error overlaying page numbers")
+        raise ValueError(msg)
+
+    for i, content_page in enumerate(content_pdf.pages):
+        footer_page = footer_pdf.pages[i]
+
+        # The `overlay` method in pikepdf is powerful. It adds the content
+        # of the footer_page as a Form XObject to the content_page.
+        content_page.add_overlay(footer_page, None)
+
+
+def add_footer_to_bundle(input_file: Path, page_numbers_pdf_path: Path, output_file: Path):
     """Overlay a footer PDF onto a content PDF.
 
     Given an input file (a series of pdfs merged together) and
     a pdf of equal length containing only the page number footers,
     this combines the two by overlaying footers on top of the input file.
-    It scales the footer according to horizontal scaling factor (an imperfect
-    solution to a difficult problem)
+    This function now uses pikepdf for consistency and robustness.
     """
-    # CONVERSION NOTE: PDF points are 1/72 inch by standard..
-    # the scaling factor between point and mm is 2.8346...
-    # a4 paper (which I've chosen for the reference page numbering) is 210mm x 297mm = 595 x 842 points.
-    # This is the reference page numbering for A4 paper size.
-    # Load the input PDF and the page numbers PDF
-    input_pdf = PdfReader(input_file)
-    page_numbers_pdf = PdfReader(page_numbers_pdf_path)
-
-    # Ensure the number of pages match
-    if len(input_pdf.pages) != len(page_numbers_pdf.pages):
-        msg = f"Page counts do not match: input={len(input_pdf.pages)} vs page numbers={len(page_numbers_pdf.pages)}"
-        bundle_logger.error("[OPN]Error overlaying page numbers")
-        raise ValueError(msg)
-
     try:
-        # Create a writer for the output PDF
-        writer = PdfWriter()
-
-        # Overlay page numbers PDF pages onto input PDF pages
-        for input_page, overlay_page in zip(input_pdf.pages, page_numbers_pdf.pages, strict=True):
-            # The content is `input_page`, the footer is `overlay_page`.
-            # We merge the footer ONTO the content page, scaling it to match the width.
-            scaling_factor = float(input_page.mediabox.width / overlay_page.mediabox.width)
-            input_page.merge_scaled_page(overlay_page, scaling_factor)
-            writer.add_page(input_page)
-
-        # Write the resulting PDF to the output file
-        with Path(output_file).open("wb") as f:
-            writer.write(f)
+        with Pdf.open(input_file) as content_pdf, Pdf.open(page_numbers_pdf_path) as footer_pdf:
+            _perform_overlay(content_pdf, footer_pdf)
+            content_pdf.save(output_file)
     except Exception:
         bundle_logger.exception("[OPN]Error overlaying page numbers")
         raise
