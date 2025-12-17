@@ -26,6 +26,7 @@ class BundleConfigParams(NamedTuple):
     logs_dir: Path | None = None
     bookmark_setting: str = "uk_abbreviated"
     all_sub_bookmarks: list[dict[str, Any]] | None = None
+    is_bundle_map: dict[str, int] | None = None
 
 
 @dataclass(init=False)
@@ -55,6 +56,7 @@ class BundleConfig:
             logs_dir,
             bookmark_setting,
             all_sub_bookmarks,
+            is_bundle_map,
         ) = bundle_config_params
 
         self.timestamp = timestamp or datetime.now().strftime("%Y-%m-%d-%H%M%S")
@@ -79,3 +81,4 @@ class BundleConfig:
         self.logs_dir = logs_dir if logs_dir else Path(base_temp) / "buntool" / "logs" / self.session_id
         self.bookmark_setting = bookmark_setting if bookmark_setting else "uk_abbreviated"
         self.all_sub_bookmarks = all_sub_bookmarks if all_sub_bookmarks is not None else []
+        self.is_bundle_map = is_bundle_map if is_bundle_map is not None else {}

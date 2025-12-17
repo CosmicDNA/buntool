@@ -170,7 +170,7 @@ function addSection() {
         <td colspan="4"><input type="text" placeholder="Enter Section Name e.g. Part 1: Pleadings [drag to position]" class="w-full"></td>
         <td><button type="button" class="remove-button" onclick="this.closest('tr').remove()">❌</button></td>
     `;
-    fileList.insertBefore(row, fileList.firstChild);
+    fileList.appendChild(row);
     row.classList.add('flash');
     setTimeout(() => row.classList.remove('flash'), 500);
 }

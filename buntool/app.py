@@ -1,4 +1,3 @@
-import csv
 import logging
 import os
 import shutil
@@ -13,7 +12,6 @@ from colorlog import ColoredFormatter
 from flask import Flask, current_app, jsonify, render_template, request, send_file
 from waitress import serve
 from werkzeug.datastructures import FileStorage
-from werkzeug.utils import secure_filename
 
 from buntool import bundle
 from buntool.bundle_config import BundleConfigParams
@@ -28,7 +26,6 @@ from buntool.bundle_config import BundleConfigParams
 
 # Constants
 MAX_FILENAME_LENGTH = 100
-MIN_CSV_COLUMNS_FOR_SECTION_CHECK = 4
 
 
 @dataclass
@@ -70,50 +67,6 @@ def get_output_filename(bundle_title: str, case_name: str, timestamp: str, fallb
     return output_file
 
 
-def synchronise_csv_index(uploaded_csv_path, filename_mappings):
-    # takes the path of the uploaded csv file and a dictionary of filename mappings (due to sanitising filenames of uploads).
-    # creates a new csv file with the same structure as the original, but with the filenames replaced with secure versions.
-    # returns the path of the new csv file.
-    logger = current_app.logger
-    sanitised_filenames_csv_path = Path(str(uploaded_csv_path).replace("index_", "securefilenames_index_"))
-    logger.info(f"secure_csv_path: {sanitised_filenames_csv_path}")
-    try:
-        with (
-            Path(uploaded_csv_path).open(newline="", encoding="utf-8") as infile,
-            Path(sanitised_filenames_csv_path).open("w", newline="", encoding="utf-8") as outfile,
-        ):
-            reader = csv.reader(infile)
-            writer = csv.writer(outfile)
-            logger.debug("Reading input CSV:")
-
-            for row in reader:
-                logger.debug(f"Processing row: {row}")
-                try:
-                    if row and (row[0] == "Filename" or (len(row) >= MIN_CSV_COLUMNS_FOR_SECTION_CHECK and row[3] == "1")):
-                        logger.debug("..Found header or section marker row")
-                        writer.writerow(row)
-                        continue
-
-                    original_upload_filename = row[0]
-                    secure_name = filename_mappings.get(original_upload_filename)
-                    if secure_name is None:
-                        secure_name = secure_filename(original_upload_filename)
-
-                    row[0] = secure_name
-                    writer.writerow(row)
-                    logger.debug(f"..Wrote processed file row: {row}")
-                except Exception:
-                    logger.exception(f"..Error processing row {row}")
-                    raise
-
-    except Exception:
-        logger.exception("..Error in save_csv_index")
-        raise
-
-    logger.info(f"..saved csv index as {sanitised_filenames_csv_path}")
-    return sanitised_filenames_csv_path
-
-
 def _get_bundle_config_from_form(form: dict, context: RequestContext, logs_dir: Path):
     """Extracts bundle configuration from the request form."""
     bundle_title = form.get("bundle_title", "Bundle") if form.get("bundle_title") else "Bundle"
@@ -144,68 +97,27 @@ def _get_bundle_config_from_form(form: dict, context: RequestContext, logs_dir: 
     )
 
 
-def save_uploaded_file(file: FileStorage, directory, filename=None):
-    """Saves a file from a request to a specified directory."""
-    if not (file and file.filename):
-        return None
-    name_to_secure = filename if filename else file.filename
-    secure_name = secure_filename(name_to_secure)
-    filepath = Path(directory) / secure_name
-    file.save(filepath)
-    current_app.logger.debug(f"Saved file: {filepath}")
-    return filepath
-
-
-def _save_and_get_path(file: FileStorage, temp_dir: Path, secure_name: str):
-    """Saves a single file and returns its path if successful, otherwise None."""
-    saved_path = save_uploaded_file(file, temp_dir, secure_name)
-    if saved_path and saved_path.exists():
-        current_app.logger.info(f"..File saved to: {saved_path}")
-        return saved_path
-    current_app.logger.error(f"File not found or failed to save at path: {saved_path}")
-    return None
-
-
-def _process_uploaded_files(files: list[FileStorage], temp_dir: Path):
-    """Saves uploaded files and creates filename mappings."""
-    # Create a mapping of original filenames to their secure versions.
-    filename_mappings = {file.filename: secure_filename(file.filename) for file in files if file.filename}
-
-    # Save files and collect their paths using a list comprehension.
-    input_files = [
-        saved_path for file in files if file.filename and (saved_path := _save_and_get_path(file, temp_dir, filename_mappings[file.filename]))
-    ]
-
-    return input_files, filename_mappings
-
-
-def _handle_coversheet_upload(request_files: dict[str, FileStorage], temp_dir: Path, session_id, timestamp: str):
-    """Handles the coversheet upload and returns its secure filename."""
+def _get_coversheet_file(request_files: dict[str, FileStorage]) -> FileStorage | None:
+    """Gets the coversheet FileStorage object from the request if it exists."""
     if "coversheet" in request_files and request_files["coversheet"].filename != "":
         current_app.logger.debug("Coversheet found in form submission")
-        cover_file = request_files["coversheet"]
-        secure_coversheet_filename = f"coversheet_{session_id}_{timestamp}.pdf"
-        coversheet_filepath = save_uploaded_file(cover_file, temp_dir, secure_coversheet_filename)
-        current_app.logger.debug(f"Coversheet path: {coversheet_filepath}")
-        return secure_coversheet_filename
+        return request_files["coversheet"]
     return None
 
 
-def _handle_csv_index_upload(request_files: dict[str, FileStorage], temp_dir: Path, session_id, timestamp: str, filename_mappings):
-    """Handles CSV index upload, sanitization, and returns the path to the sanitized CSV."""
+def _handle_csv_index_upload(request_files: dict[str, FileStorage]):
+    """Handles CSV index upload and returns its content as a string."""
     if "csv_index" in request_files and request_files["csv_index"].filename:
         csv_file = request_files["csv_index"]
-        secure_csv_filename = f"index_{session_id}_{timestamp}.csv"
-        saved_csv_path = save_uploaded_file(csv_file, temp_dir, secure_csv_filename)
-
-        if not saved_csv_path or not Path(saved_csv_path).exists():
-            msg = f"Index data did not upload correctly. Session code: {session_id}"
-            current_app.logger.error(f"CSV file not found or failed to save at path: {saved_csv_path}")
+        try:
+            # Read the content of the file stream directly into a string
+            csv_content = csv_file.stream.read().decode("utf-8")
+        except Exception as e:
+            msg = f"Could not read uploaded CSV index: {e}"
+            current_app.logger.exception(msg)  # Use .exception for logging with traceback
             # We return a tuple (error_response, None) to be handled by the caller
             return jsonify({"status": "error", "message": msg}), 400, None
-
-        sanitised_csv_path = synchronise_csv_index(saved_csv_path, filename_mappings)
-        return None, None, sanitised_csv_path
+        return None, None, csv_content
 
     return None, None, None
 
@@ -291,29 +203,23 @@ def create_bundle():
             current_app.logger.error(msg)
             return jsonify({"status": "error", "message": msg}), 400
 
-        input_files, filename_mappings = _process_uploaded_files(files, temp_dir)
+        coversheet_file = _get_coversheet_file(request.files)
 
-        secure_coversheet_filename = _handle_coversheet_upload(request.files, temp_dir, session_id, timestamp)
-
-        error_response, status_code, sanitised_filenames_index_csv = _handle_csv_index_upload(
-            request.files, temp_dir, session_id, timestamp, filename_mappings
-        )
+        error_response, status_code, csv_content_string = _handle_csv_index_upload(request.files)
         if error_response:
             # If status_code is None, default to 400
             return error_response if status_code is None else (error_response, status_code)
 
+        bundle_config.csv_string = csv_content_string or ""
         log_msg = f"""
             Calling buntool.create_bundle with params:
-            ....input_files: {input_files}
+            ....input_files: {[f.filename for f in files]}
             ....output_file: {output_file}
-            ....secure_coversheet_filename: {secure_coversheet_filename}
-            ....sanitised_filenames_index_csv: {sanitised_filenames_index_csv}
+            ....coversheet_file: {coversheet_file.filename if coversheet_file else "None"}
             ....bundle_config elements: {bundle_config.__dict__}"""
         current_app.logger.info(textwrap.dedent(log_msg))
 
-        received_output_file, zip_file_path = bundle.create_bundle(
-            input_files, output_file, secure_coversheet_filename, sanitised_filenames_index_csv, bundle_config
-        )
+        received_output_file, zip_file_path = bundle.create_bundle(files, output_file, coversheet_file, None, bundle_config)
         t2 = datetime.now()
 
         delta = t2 - t1
