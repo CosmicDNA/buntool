@@ -32,11 +32,11 @@ def _setup_document_style(doc: DocumentObject, index_font_setting):
         style.font.name = font_name
 
 
-def _add_docx_header(doc: DocumentObject, casedetails: list[str], confidential):
+def _add_docx_header(doc: DocumentObject, casedetails: dict[str, str], confidential: bool):
     # Set up case details
-    claimno_hdr = casedetails[1] if casedetails[1] else ""
-    casename = casedetails[2] if casedetails[2] else ""
-    bundle_name = casedetails[0].upper() if casedetails[0] else ""
+    claimno_hdr = casedetails.get("claim_no", "")
+    casename = casedetails.get("case_name", "")
+    bundle_name = casedetails.get("bundle_title", "").upper()
 
     # Add the Claim Number (if exists)
     if claimno_hdr:
@@ -101,7 +101,7 @@ def _create_and_populate_table(doc: DocumentObject, toc_entries, date_setting):
             row[3].text = str(entry[3])  # Page
 
 
-def create_toc_docx(toc_entries, casedetails: list[str], output_file_path, config: DocxConfig):
+def create_toc_docx(toc_entries, casedetails: dict[str, str], output_file_path, config: DocxConfig):
     """Creates a Table of Contents in a .docx file."""
     doc = Document()
 
@@ -124,7 +124,7 @@ if __name__ == "__main__":
         ("004", "Document Number Four", "2021-01-04", 15),
         ("005", "The fifth document in this series", "2021-01-05", 20),
     ]
-    casedetails = ["Bundle Name", "Claim Number", "Case Name"]
+    casedetails = {"bundle_title": "Bundle Name", "claim_no": "Claim Number", "case_name": "Case Name"}
     output_file_path = "TOC.docx"
 
     docx_config = DocxConfig(confidential=True, date_setting=False)
