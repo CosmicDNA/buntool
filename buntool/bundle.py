@@ -874,7 +874,7 @@ def _build_reportlab_main_table(table_data, list_of_section_breaks, col_widths):
     return toc_table
 
 
-def create_toc_pdf_reportlab(toc_entries, bundle_config: BundleConfig, output_file, options: dict) -> int:
+def create_toc_pdf_reportlab(toc_entries, bundle_config: BundleConfig, options: dict) -> tuple[io.BytesIO, int]:
     """Generate a table of contents PDF using ReportLab."""
     casedetails = bundle_config.case_details
     styles = _get_toc_pdf_styles(options.get("date_setting"), bundle_config.index_font)
@@ -889,9 +889,8 @@ def create_toc_pdf_reportlab(toc_entries, bundle_config: BundleConfig, output_fi
     page_offset = 1 + (0 if options.get("dummy") else bundle_config.expected_length_of_frontmatter)
     styleSheet = _setup_reportlab_styles(main_font, bold_font, base_font_size)
 
-    reportlab_pdf = SimpleDocTemplate(
-        str(output_file), pagesize=A4, rightMargin=1.5 * cm, leftMargin=1.5 * cm, topMargin=1 * cm, bottomMargin=1.5 * cm
-    )
+    buffer = io.BytesIO()
+    reportlab_pdf = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=1.5 * cm, leftMargin=1.5 * cm, topMargin=1 * cm, bottomMargin=1.5 * cm)
 
     # Build header elements
     header_elements = _build_reportlab_doc_header(casedetails, styleSheet, options.get("confidential", False))
@@ -928,7 +927,8 @@ def create_toc_pdf_reportlab(toc_entries, bundle_config: BundleConfig, output_fi
     else:
         reportlab_pdf.build(elements)
 
-    return reportlab_pdf.page
+    buffer.seek(0)
+    return buffer, reportlab_pdf.page
 
 
 def generate_footer_pages_reportlab(filename, num_pages, bundle_config):
@@ -1284,7 +1284,7 @@ def _process_index_and_merge(bundle_config: BundleConfig, index_file, temp_path:
     return index_data, toc_entries, merged_file, main_page_count, is_bundle_map
 
 
-def _create_front_matter(bundle_config, coversheet, coversheet_path, temp_path: Path, toc_entries):
+def _create_front_matter(bundle_config, coversheet, coversheet_path, toc_entries):
     """Create and merge front matter (coversheet and TOC). Returns any temporary files created."""
     if coversheet and coversheet_path and Path(coversheet_path).exists():
         with Pdf.open(coversheet_path) as coversheet_pdf:
@@ -1298,16 +1298,12 @@ def _create_front_matter(bundle_config, coversheet, coversheet_path, temp_path: 
 
     # Generate the TOC once with placeholder page numbers to get its length.
     # The real page numbers will be updated later.
-    toc_pdf_path = temp_path / "index.pdf"
-    options = {"confidential": bundle_config.confidential_bool, "date_setting": bundle_config.date_setting, "dummy": True}
+    options = {"confidential": bundle_config.confidential_bool, "date_setting": bundle_config.date_setting, "dummy": True, "roman_numbering": False}
     try:
-        length_of_toc = create_toc_pdf_reportlab(toc_entries, bundle_config, toc_pdf_path, options)
+        _, length_of_toc = create_toc_pdf_reportlab(toc_entries, bundle_config, options)
     except Exception:
         bundle_logger.exception("[CB]Error during initial TOC creation")
         raise
-    if not toc_pdf_path.exists():
-        bundle_logger.error(f"[CB]Initial TOC file creation unsuccessful: cannot locate expected output {toc_pdf_path}.")
-        return None, None, None, []
 
     expected_length_of_frontmatter = length_of_coversheet + length_of_toc
     bundle_config.total_number_of_pages = bundle_config.main_page_count + expected_length_of_frontmatter
@@ -1321,7 +1317,7 @@ class TocParams(NamedTuple):
     bundle_config: BundleConfig
     temp_path: Path
     toc_entries: list
-    length_of_coversheet: int | None
+    coversheet_path: Path | None
     expected_length_of_frontmatter: int
     toc_file_path: Path
 
@@ -1338,10 +1334,10 @@ def _validate_toc_creation(toc_file_path: Path):
 
 
 def _create_toc(toc_params: TocParams):
-    (bundle_config, temp_path, toc_entries, length_of_coversheet, expected_length_of_frontmatter, toc_file_path) = toc_params
+    (bundle_config, temp_path, toc_entries, coversheet_path, expected_length_of_frontmatter, toc_file_path) = toc_params
 
     # bundle_config.expected_length_of_frontmatter = length_of_coversheet if length_of_coversheet is not None else 0  # janky reset for TOC
-    bundle_config.expected_length_of_frontmatter = expected_length_of_frontmatter
+    bundle_config.expected_length_of_frontmatter = expected_length_of_frontmatter  # TODO: this is a mess.
 
     # Now, create TOC PDF For real:
     log_msg = f"""
@@ -1364,7 +1360,7 @@ def _create_toc(toc_params: TocParams):
             "dummy": False,
             "roman_numbering": bundle_config.roman_for_preface,
         }
-        pdf_future = executor.submit(create_toc_pdf_reportlab, toc_entries, bundle_config, toc_file_path, pdf_options)
+        pdf_future = executor.submit(create_toc_pdf_reportlab, toc_entries, bundle_config, pdf_options)
 
         # Submit DOCX TOC creation
         docx_output_path = temp_path / "docx_output.docx"
@@ -1377,8 +1373,7 @@ def _create_toc(toc_params: TocParams):
 
         # Wait for both to complete and get results
         try:
-            length_of_toc = pdf_future.result()
-            _validate_toc_creation(toc_file_path)
+            toc_buffer, length_of_toc = pdf_future.result()
         except Exception as e:
             bundle_logger.exception("[CB]..Error during create_toc_pdf_reportlab")
             raise CreateTocError from e
@@ -1390,7 +1385,7 @@ def _create_toc(toc_params: TocParams):
             # We can continue without the docx if it fails
             docx_output_path = None
 
-    return docx_output_path, length_of_toc
+    return docx_output_path, toc_buffer, length_of_toc
 
 
 class HyperlinkingError(Exception):
@@ -1513,7 +1508,7 @@ class PaginationError(Exception):
 
 
 def paginate_merged_main_files(merged_file, merged_paginated_no_toc, bundle_config: BundleConfig):
-    # Next step: paginate the merged main files of the PDF (the main content)
+    """Paginates a PDF from a file path and returns an in-memory pikepdf.Pdf object."""
     log_msg = f"""
         [CB]Calling pdf_paginator_reportlab [PPRL] with arguments:
         ....merged_file: {merged_file}
@@ -1524,14 +1519,17 @@ def paginate_merged_main_files(merged_file, merged_paginated_no_toc, bundle_conf
         ....footer_prefix: {bundle_config.footer_prefix}"""
     dedent_and_log(bundle_logger, log_msg)
     with Pdf.open(merged_file, allow_overwriting_input=True) as pdf:
-        paginated_page_count = pdf_paginator_reportlab(pdf, bundle_config)
-        if paginated_page_count != bundle_config.main_page_count:
-            bundle_logger.warning(
-                f"Pagination count mismatch: expected {bundle_config.main_page_count}, but got {paginated_page_count}. Continuing."
-            )
-        pdf.save(merged_paginated_no_toc)
-
-    return merged_paginated_no_toc
+        paginated_count = pdf_paginator_reportlab(pdf, bundle_config)
+        if paginated_count != bundle_config.main_page_count:
+            bundle_logger.warning(f"Pagination count mismatch: expected {bundle_config.main_page_count}, but got {paginated_count}. Continuing.")
+        # To prevent content stream errors when merging, we "sanitize" the PDF
+        # by saving it to an in-memory buffer and reopening it.
+        buffer = io.BytesIO()
+        pdf.save(buffer)
+        buffer.seek(0)
+        sanitized_pdf = Pdf.open(buffer)
+        bundle_logger.debug("[PPRL]..Sanitized paginated PDF in memory.")
+        return sanitized_pdf
 
 
 class FrontMatterError(Exception):
@@ -1543,83 +1541,46 @@ class FrontMatterError(Exception):
 
 
 class SaveMergedFilesWithFrontmasterParams(NamedTuple):
-    temp_path: Path
-    toc_file_path: Path
-    coversheet: bool
+    paginated_pdf_obj: Pdf
+    toc_buffer: io.BytesIO
     coversheet_path: Path | None
-    bundle_config: BundleConfig
-    expected_length_of_frontmatter: int
-    length_of_dummy_toc: int | None
-    merged_paginated_no_toc: Path
-    merged_file_with_frontmatter: Path
 
 
 def save_merged_files_with_frontmaster(params: SaveMergedFilesWithFrontmasterParams):
-    (
-        temp_path,
-        toc_file_path,
-        coversheet,
-        coversheet_path,
-        bundle_config,
-        expected_length_of_frontmatter,
-        length_of_dummy_toc,
-        merged_paginated_no_toc,
-        merged_file_with_frontmatter,
-    ) = params
+    """Merges frontmatter (coversheet, TOC) with the main content, all in memory."""
+    paginated_pdf_obj, toc_buffer, coversheet_path = params
 
-    frontmatter = temp_path / "TEMP00-coversheet-plus-toc.pdf"
-    if coversheet:
-        if coversheet_path and Path(coversheet_path).exists():
-            frontmatterfiles = [coversheet_path, toc_file_path]
-            log_msg = f"""
-                [CB]Coversheet specified. Calling merge_frontmatter [MF] with arguments:
-                ....frontmatterfiles: {frontmatterfiles}, frontmatter: {frontmatter}"""
-            dedent_and_log(bundle_logger, log_msg)
+    final_pdf = Pdf.new()
 
-            def merge_frontmatter(input_files, output_file):
-                """Merge uploaded coversheet and generated index.
+    # 1. Add coversheet if it exists
+    if coversheet_path and coversheet_path.exists():
+        try:
+            with Pdf.open(coversheet_path) as coversheet_pdf:
+                final_pdf.pages.extend(coversheet_pdf.pages)
+        except Exception as e:
+            raise FrontMatterError("B", f"Failed to open coversheet: {e}") from e
+    elif coversheet_path:
+        raise FrontMatterError("B", f"Coversheet specified but not found at {coversheet_path}.")
 
-                This is for cases where a coversheet is specified. The resulting
-                frontmatter is pre-pended to the main bundle.
-                """
-                pdf = Pdf.new()
-                for input_file in input_files:
-                    with Pdf.open(input_file) as src:
-                        pdf.pages.extend(src.pages)
-                    pdf.save(output_file)
-                return output_file
-
-            frontmatter_path = merge_frontmatter(frontmatterfiles, frontmatter)
-            if not Path(frontmatter_path).exists():
-                raise FrontMatterError("A", f"[CB]..Merging frontmatter unsuccessful: cannot locate expected ouput {frontmatter_path}.")
-            bundle_logger.info(f"[CB]..Frontmatter created at {Path(frontmatter_path).name}")
-        else:
-            raise FrontMatterError("B", f"[CB]..Coversheet specified but not found at {coversheet_path}.")
+    # 2. Add Table of Contents
+    if toc_buffer:
+        try:
+            with Pdf.open(toc_buffer) as toc_pdf:
+                final_pdf.pages.extend(toc_pdf.pages)
+        except Exception as e:
+            raise FrontMatterError("C", f"Failed to open in-memory TOC buffer: {e}") from e
     else:
-        frontmatter_path = toc_file_path
         bundle_logger.info("[CB]No coversheet specified. TOC is the only frontmatter.")
 
-    # The length of the frontmatter is now known without opening the file
-    length_of_frontmatter = bundle_config.expected_length_of_frontmatter
-    bundle_logger.debug(f"[CB]Frontmatter length is {length_of_frontmatter} pages.")
-    if not bundle_config.roman_for_preface:
-        if length_of_frontmatter != expected_length_of_frontmatter:
-            error_msg = f"[CB]..Frontmatter length mismatch: expected {length_of_frontmatter} pages, got {expected_length_of_frontmatter}."
-            raise FrontMatterError("C", error_msg)
-        bundle_logger.info(f"[CB]..Frontmatter length matches expected {length_of_dummy_toc} pages.")
+    # Get the length of the frontmatter we just added
+    length_of_frontmatter = len(final_pdf.pages)
+    bundle_logger.debug(f"[CB]In-memory frontmatter created with {length_of_frontmatter} pages.")
 
-    # Prepend the frontmatter to the main (paginated) PDF object in memory
-    with Pdf.open(merged_paginated_no_toc, allow_overwriting_input=True) as main_pdf, Pdf.open(frontmatter_path) as frontmatter_pdf:
-        # The `insert` method only takes one page at a time.
-        # To prepend multiple pages, we can use `extend` on a new list.
-        final_pages = list(frontmatter_pdf.pages)
-        final_pages.extend(main_pdf.pages)
-        del main_pdf.pages[:]
-        main_pdf.pages.extend(final_pages)
-        main_pdf.save(merged_file_with_frontmatter)
+    # 3. Add the main paginated content
+    final_pdf.pages.extend(paginated_pdf_obj.pages)
 
-    bundle_logger.info(f"[CB]..Saved merged PDF with frontmatter to {merged_file_with_frontmatter}")
-    return frontmatter_path, length_of_frontmatter
+    bundle_logger.info("[CB]..Successfully merged frontmatter and main content in memory.")
+    return final_pdf, length_of_frontmatter
 
 
 def _calculate_hyperlink_coords(pdf_in_memory: Pdf, length_of_coversheet: int | None, length_of_frontmatter: int, toc_entries: list) -> list:
@@ -1693,15 +1654,13 @@ def _assemble_final_bundle(
     with ThreadPoolExecutor(max_workers=2) as executor:
         # Submit pagination and TOC creation to run in parallel
         pagination_future = executor.submit(paginate_merged_main_files, merged_file, merged_paginated_no_toc, bundle_config)
-        toc_future = executor.submit(
-            _create_toc,
-            TocParams(bundle_config, temp_path, toc_entries, length_of_coversheet, bundle_config.expected_length_of_frontmatter, toc_file_path),
-        )
+        toc_params = TocParams(bundle_config, temp_path, toc_entries, coversheet_path, bundle_config.expected_length_of_frontmatter, toc_file_path)
+        toc_future = executor.submit(_create_toc, toc_params)
 
         try:
             # Retrieve results
             paginated_pdf = pagination_future.result()
-            docx_output_path, length_of_toc = toc_future.result()
+            docx_output_path, toc_buffer, length_of_toc = toc_future.result()
         except Exception as e:
             # Handle exceptions from either task
             if isinstance(e, CreateTocError):
@@ -1717,33 +1676,23 @@ def _assemble_final_bundle(
 
     bundle_config.expected_length_of_frontmatter = (length_of_coversheet or 0) + length_of_toc
     try:
-        frontmatter_path, length_of_frontmatter = save_merged_files_with_frontmaster(
-            SaveMergedFilesWithFrontmasterParams(
-                temp_path,
-                toc_file_path,
-                coversheet,
-                coversheet_path,
-                bundle_config,
-                bundle_config.expected_length_of_frontmatter,
-                length_of_toc,
-                paginated_pdf,
-                merged_file_with_frontmatter,
-            )
+        final_pdf_obj, length_of_frontmatter = save_merged_files_with_frontmaster(
+            SaveMergedFilesWithFrontmasterParams(paginated_pdf_obj=paginated_pdf, toc_buffer=toc_buffer, coversheet_path=coversheet_path)
         )
     except FrontMatterError:
         bundle_logger.exception("CB..Saving merged files with frontmatter failed.")
         return None
 
     try:
-        with Pdf.open(merged_file_with_frontmatter, allow_overwriting_input=True) as pdf:
-            list_of_annotation_coords = _calculate_hyperlink_coords(pdf, length_of_coversheet, length_of_frontmatter, toc_entries)
-            add_annotations_with_transform(pdf, list_of_annotation_coords)
-            _adjust_inner_bundle_links(pdf, toc_entries, index_data, length_of_frontmatter, bundle_config.is_bundle_map)
-            add_bookmarks_to_pdf(pdf, toc_entries, length_of_frontmatter, bundle_config)
-            bookmark_the_index(pdf, coversheet_path)
-            if bundle_config.roman_for_preface:
-                add_roman_labels(pdf, length_of_frontmatter)
-            pdf.save(tmp_output_file)
+        # All final modifications happen on the in-memory final_pdf_obj
+        list_of_annotation_coords = _calculate_hyperlink_coords(final_pdf_obj, length_of_coversheet, length_of_frontmatter, toc_entries)
+        add_annotations_with_transform(final_pdf_obj, list_of_annotation_coords)
+        _adjust_inner_bundle_links(final_pdf_obj, toc_entries, index_data, length_of_frontmatter, bundle_config.is_bundle_map)
+        add_bookmarks_to_pdf(final_pdf_obj, toc_entries, length_of_frontmatter, bundle_config)
+        bookmark_the_index(final_pdf_obj, coversheet_path)
+        if bundle_config.roman_for_preface:
+            add_roman_labels(final_pdf_obj, length_of_frontmatter)
+        final_pdf_obj.save(tmp_output_file)
 
     except Exception as e:
         if isinstance(e, HyperlinkingError):
@@ -1791,7 +1740,7 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
 
         index_data = index_data or {}
         expected_length_of_frontmatter, length_of_coversheet, length_of_dummy_toc, frontmatter_temp_files = _create_front_matter(
-            bundle_config, coversheet, coversheet_path, temp_path, toc_entries
+            bundle_config, coversheet, coversheet_path, toc_entries
         )
         if expected_length_of_frontmatter is None:
             return None, None
