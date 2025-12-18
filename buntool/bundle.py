@@ -44,7 +44,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from itertools import count, groupby
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple, cast
 
 import pdfplumber
 
@@ -412,7 +412,7 @@ def _process_pdf_file(file_path: Path) -> dict:
         }
 
 
-def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
+def merge_pdfs_create_toc_entries(input_files, index_data: dict):
     """Merge PDFs and create table of contents entries.
 
     index_data is the roadmap for the bundle creation.
@@ -482,8 +482,7 @@ def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
         final_pdf.pages.extend(src_pdf.pages)
         is_bundle_map[filename] = result["is_bundle"]
 
-    final_pdf.save(output_file)
-    return toc_entries, all_sub_bookmarks, is_bundle_map, page_counts["total"]
+    return final_pdf, toc_entries, all_sub_bookmarks, is_bundle_map, page_counts["total"]
 
 
 def _create_bookmark_item(entry, length_of_frontmatter, bundle_config: BundleConfig):
@@ -1217,7 +1216,9 @@ def _initialize_bundle_creation(bundle_config_data: BundleConfig, output_file, c
     return bundle_config, temp_path, tmp_output_file, coversheet_path, initial_temp_files + input_files
 
 
-def _process_index_and_merge(bundle_config: BundleConfig, index_file, temp_path: Path, input_files):
+def _process_index_and_merge(
+    bundle_config: BundleConfig, index_file, temp_path: Path, input_files
+) -> tuple[dict[str, Any] | None, list | None, Pdf | None, int | None, dict[str, int] | None]:
     """Process index data and merge input PDFs. Returns index data, toc entries, and a list of temp files."""
     if not index_file and bundle_config.csv_string:
         index_file_path = temp_path / "index.csv"
@@ -1234,24 +1235,20 @@ def _process_index_and_merge(bundle_config: BundleConfig, index_file, temp_path:
         bundle_logger.info("[CB]No index data provided.")
 
     # Merge PDFs using provided unique filenames
-    merged_file = temp_path / "TEMP01_mainpages.pdf"
     log_msg = f"""
         [CB]Calling merge_pdfs_create_toc_entries [MP] with arguments:
         ....input_files: {input_files}
-        ....merged_file: {merged_file}
         ....index_data: {index_data}"""
     dedent_and_log(bundle_logger, log_msg)
     try:
-        toc_entries, all_sub_bookmarks, is_bundle_map, main_page_count = merge_pdfs_create_toc_entries(input_files, merged_file, index_data)
+        merged_pdf_obj, toc_entries, all_sub_bookmarks, is_bundle_map, main_page_count = merge_pdfs_create_toc_entries(input_files, index_data)
     except Exception:
         bundle_logger.exception("[CB]Error while merging pdf files")
         raise
     else:
-        if not Path(merged_file).exists():
-            bundle_logger.info(f"[CB]Merging file unsuccessful: cannot locate expected ouput {merged_file}.")
+        if not merged_pdf_obj:
+            bundle_logger.error("[CB]Merging files unsuccessful: merged PDF object is None.")
             return None, None, None, None, None
-
-        bundle_logger.info(f"[CB]Merged PDF created at {merged_file}")
     bundle_config.all_sub_bookmarks = all_sub_bookmarks
     # list out settings in a human-readable way for remote user support.
     # The file_details log has been removed as it was inefficiently opening files.
@@ -1281,7 +1278,7 @@ def _process_index_and_merge(bundle_config: BundleConfig, index_file, temp_path:
     dedent_and_log(bundle_logger, user_settings_log)
 
     bundle_config.main_page_count = main_page_count
-    return index_data, toc_entries, merged_file, main_page_count, is_bundle_map
+    return index_data, toc_entries, merged_pdf_obj, main_page_count, is_bundle_map
 
 
 def _create_front_matter(bundle_config, coversheet, coversheet_path, toc_entries):
@@ -1313,7 +1310,7 @@ def _create_front_matter(bundle_config, coversheet, coversheet_path, toc_entries
     return expected_length_of_frontmatter, length_of_coversheet, length_of_toc, temp_files
 
 
-class TocParams(NamedTuple):
+class TocParams(NamedTuple):  # Already defined
     bundle_config: BundleConfig
     temp_path: Path
     toc_entries: list
@@ -1325,12 +1322,6 @@ class TocParams(NamedTuple):
 class CreateTocError(Exception):
     def __init__(self, message="TOC PDF creation failed."):
         super().__init__(message)
-
-
-def _validate_toc_creation(toc_file_path: Path):
-    """Check if the TOC PDF was created and raise an error if not."""
-    if not toc_file_path.exists():
-        raise CreateTocError()
 
 
 def _create_toc(toc_params: TocParams):
@@ -1442,7 +1433,7 @@ def _adjust_inner_bundle_links(pdf: Pdf, toc_entries: list, index_data: dict, le
 class AssembleFinalBundleParams(NamedTuple):
     bundle_config: BundleConfig
     temp_path: Path
-    merged_file: Path
+    merged_pdf_obj: Pdf
     toc_entries: list
     index_data: dict
     length_of_coversheet: int | None
@@ -1507,29 +1498,26 @@ class PaginationError(Exception):
         super().__init__(self.message)
 
 
-def paginate_merged_main_files(merged_file, merged_paginated_no_toc, bundle_config: BundleConfig):
-    """Paginates a PDF from a file path and returns an in-memory pikepdf.Pdf object."""
+def paginate_merged_main_files(pdf_obj: Pdf, bundle_config: BundleConfig) -> Pdf:
+    """Paginates an in-memory PDF object and returns a sanitized in-memory pikepdf.Pdf object."""
     log_msg = f"""
         [CB]Calling pdf_paginator_reportlab [PPRL] with arguments:
-        ....merged_file: {merged_file}
-        ....merged_paginated_no_toc: {merged_paginated_no_toc}
         ....page_num_alignment: {bundle_config.page_num_align}
         ....page_num_font: {bundle_config.footer_font}
         ....page_numbering_style: {bundle_config.page_num_style}
         ....footer_prefix: {bundle_config.footer_prefix}"""
     dedent_and_log(bundle_logger, log_msg)
-    with Pdf.open(merged_file, allow_overwriting_input=True) as pdf:
-        paginated_count = pdf_paginator_reportlab(pdf, bundle_config)
-        if paginated_count != bundle_config.main_page_count:
-            bundle_logger.warning(f"Pagination count mismatch: expected {bundle_config.main_page_count}, but got {paginated_count}. Continuing.")
-        # To prevent content stream errors when merging, we "sanitize" the PDF
-        # by saving it to an in-memory buffer and reopening it.
-        buffer = io.BytesIO()
-        pdf.save(buffer)
-        buffer.seek(0)
-        sanitized_pdf = Pdf.open(buffer)
-        bundle_logger.debug("[PPRL]..Sanitized paginated PDF in memory.")
-        return sanitized_pdf
+    paginated_count = pdf_paginator_reportlab(pdf_obj, bundle_config)
+    if paginated_count != bundle_config.main_page_count:
+        bundle_logger.warning(f"Pagination count mismatch: expected {bundle_config.main_page_count}, but got {paginated_count}. Continuing.")
+    # To prevent content stream errors when merging, we "sanitize" the PDF
+    # by saving it to an in-memory buffer and reopening it.
+    buffer = io.BytesIO()
+    pdf_obj.save(buffer)
+    buffer.seek(0)
+    sanitized_pdf = Pdf.open(buffer)
+    bundle_logger.debug("[PPRL]..Sanitized paginated PDF in memory.")
+    return sanitized_pdf
 
 
 class FrontMatterError(Exception):
@@ -1624,7 +1612,7 @@ def _assemble_final_bundle(
     (
         bundle_config,
         temp_dir,
-        merged_file,
+        merged_pdf_obj,
         toc_entries,
         index_data,
         length_of_coversheet,
@@ -1653,7 +1641,7 @@ def _assemble_final_bundle(
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         # Submit pagination and TOC creation to run in parallel
-        pagination_future = executor.submit(paginate_merged_main_files, merged_file, merged_paginated_no_toc, bundle_config)
+        pagination_future = executor.submit(paginate_merged_main_files, merged_pdf_obj, bundle_config)
         toc_params = TocParams(bundle_config, temp_path, toc_entries, coversheet_path, bundle_config.expected_length_of_frontmatter, toc_file_path)
         toc_future = executor.submit(_create_toc, toc_params)
 
@@ -1731,15 +1719,15 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
     )
 
     try:
-        index_data, toc_entries, merged_file_path, main_page_count, is_bundle_map = _process_index_and_merge(
+        index_data, toc_entries, merged_pdf_obj, main_page_count, is_bundle_map = _process_index_and_merge(
             bundle_config, index_file, temp_path, input_files
         )
-        if not merged_file_path:
-            bundle_logger.error("Merging process failed, merged_file is None.")
+        if not merged_pdf_obj:
+            bundle_logger.error("Merging process failed, merged PDF object is None.")
             return None, None
 
         index_data = index_data or {}
-        expected_length_of_frontmatter, length_of_coversheet, length_of_dummy_toc, frontmatter_temp_files = _create_front_matter(
+        expected_length_of_frontmatter, length_of_coversheet, _, frontmatter_temp_files = _create_front_matter(
             bundle_config, coversheet, coversheet_path, toc_entries
         )
         if expected_length_of_frontmatter is None:
@@ -1754,7 +1742,7 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
             AssembleFinalBundleParams(
                 bundle_config=bundle_config,
                 temp_path=temp_path,
-                merged_file=merged_file_path,
+                merged_pdf_obj=cast(Pdf, merged_pdf_obj),
                 toc_entries=toc_entries,
                 index_data=index_data,
                 length_of_coversheet=length_of_coversheet,
@@ -1769,7 +1757,7 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
         docx_output_path, final_bundle_temp_files = result
 
         # Combine all temporary files at the end
-        created_temp_files = [merged_file_path] + (frontmatter_temp_files or []) + (final_bundle_temp_files or [])
+        created_temp_files = (frontmatter_temp_files or []) + (final_bundle_temp_files or [])
 
     except Exception:
         bundle_logger.exception("[CB]Error during create_bundle")
