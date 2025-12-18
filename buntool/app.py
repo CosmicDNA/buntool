@@ -233,6 +233,8 @@ def create_bundle():
 
     finally:
         if session_file_handler and session_file_handler in current_app.logger.handlers:
+            # This is crucial to release file handles and allow garbage collection
+            session_file_handler.close()
             current_app.logger.removeHandler(session_file_handler)
 
 
