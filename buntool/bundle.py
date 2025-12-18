@@ -91,10 +91,11 @@ MIN_CSV_COLUMNS_WITH_SECTION = 4
 MIN_CSV_COLUMNS_NO_SECTION = 3
 MIN_TOC_ENTRY_FIELDS = 3
 
+CPU_COUNT = os.cpu_count()
+
 bundle_logger = logging.getLogger("bundle_logger")
 
 thread_local = threading.local()
-worker_id_counter = count(1)
 
 
 def init_worker(counter):
@@ -110,9 +111,12 @@ class ThreadIdFormatter(ColoredFormatter):
 
     def format(self, record):
         # If the log record is from a worker thread, prepend its ID.
+        # First, let the parent ColoredFormatter format the record, including colors.
+        formatted_message = super().format(record)
+        # Then, if a worker ID exists, prepend it to the already formatted message.
         if hasattr(thread_local, "worker_id"):
-            record.msg = f"[T-{thread_local.worker_id}] {record.msg}"  # Prepend to the message
-        return super().format(record)
+            return f"[🧵-{thread_local.worker_id}] {formatted_message}"
+        return formatted_message
 
 
 def configure_logger(bundle_config, session_id=None):
@@ -464,7 +468,7 @@ def merge_pdfs_create_toc_entries(input_files, index_data: dict):
     is_bundle_map = {}  # To store results of is_bundle checks
     filename_to_results = {}
 
-    with ThreadPoolExecutor(max_workers=os.cpu_count(), initializer=init_worker, initargs=(count(1),)) as executor:
+    with ThreadPoolExecutor(max_workers=CPU_COUNT, initializer=init_worker, initargs=(count(1),)) as executor:
         # Map filenames from index_data to actual file paths
         files_to_process = {
             file
@@ -1364,8 +1368,8 @@ def _create_toc(toc_params: TocParams):
         ....dummy: False
         ....length_of_frontmatter: {expected_length_of_frontmatter}"""
     dedent_and_log(bundle_logger, log_msg)
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    # Use the number of workers needed, but cap it at the number of available CPUs.
+    with ThreadPoolExecutor(max_workers=CPU_COUNT, initializer=init_worker, initargs=(count(1),)) as executor:
         # Submit PDF TOC creation
         pdf_options = {
             "confidential": bundle_config.confidential_bool,
@@ -1463,54 +1467,6 @@ class AssembleFinalBundleParams(NamedTuple):
     tmp_output_file: Path
 
 
-class PathsTuple(NamedTuple):
-    merged_paginated_no_toc: Path
-    page_numbers_pdf: Path
-    page_numbers_aux: Path
-    page_numbers_tex: Path
-    toc_file_path: Path
-    toc_out: Path
-    toc_log: Path
-    toc_aux: Path
-    toc_tex: Path
-    merged_file_with_frontmatter: Path
-    hyperlinked_file: Path
-    main_bookmarked_file: Path
-    index_bookmarked_file: Path
-
-
-def get_paths(temp_path: Path):
-    # Define all potential temporary file paths upfront
-    merged_paginated_no_toc = temp_path / "TEMP03_paginated_mainpages.pdf"
-    page_numbers_pdf = temp_path / "pageNumbers.pdf"
-    page_numbers_aux = temp_path / "pageNumbers.aux"
-    page_numbers_tex = temp_path / "pageNumbers.tex"
-    toc_file_path = temp_path / "index.pdf"
-    toc_out = temp_path / "index.out"
-    toc_log = temp_path / "index.log"
-    toc_aux = temp_path / "index.aux"
-    toc_tex = temp_path / "toc.tex"
-    merged_file_with_frontmatter = temp_path / "TEMP04_all_pages.pdf"
-    hyperlinked_file = temp_path / "TEMP05-hyperlinked.pdf"
-    main_bookmarked_file = temp_path / "TEMP06_main_bookmarks.pdf"
-    index_bookmarked_file = temp_path / "TEMP07_all_bookmarks.pdf"
-    return PathsTuple(
-        merged_paginated_no_toc,
-        page_numbers_pdf,
-        page_numbers_aux,
-        page_numbers_tex,
-        toc_file_path,
-        toc_out,
-        toc_log,
-        toc_aux,
-        toc_tex,
-        merged_file_with_frontmatter,
-        hyperlinked_file,
-        main_bookmarked_file,
-        index_bookmarked_file,
-    )
-
-
 class PaginationError(Exception):
     """Custom exception for pagination errors."""
 
@@ -1595,7 +1551,7 @@ def _calculate_hyperlink_coords(pdf_in_memory: Pdf, length_of_coversheet: int | 
     pdf_in_memory.save(buffer)
     buffer.seek(0)  # Rewind the buffer to the beginning
 
-    with pdfplumber.open(buffer) as pdf, ThreadPoolExecutor() as executor:
+    with pdfplumber.open(buffer) as pdf, ThreadPoolExecutor(max_workers=CPU_COUNT, initializer=init_worker, initargs=(count(1),)) as executor:
         # Step 1: Parallelize the text extraction from each TOC page.
         bundle_logger.debug(f"[HYP]..Opened in-memory PDF with pdfplumber. It has {len(pdf.pages)} pages.")
         bundle_logger.debug(f"[HYP]..Coversheet length: {length_of_coversheet}, Frontmatter length: {length_of_frontmatter}")
@@ -1644,22 +1600,7 @@ def _assemble_final_bundle(
     ) = assemble_final_bundle_params
 
     temp_path = Path(temp_dir)
-
-    (
-        merged_paginated_no_toc,
-        page_numbers_pdf,
-        page_numbers_aux,
-        page_numbers_tex,
-        toc_file_path,
-        toc_out,
-        toc_log,
-        toc_aux,
-        toc_tex,
-        merged_file_with_frontmatter,
-        hyperlinked_file,
-        main_bookmarked_file,
-        index_bookmarked_file,
-    ) = get_paths(temp_path)
+    toc_file_path = temp_path / "index.pdf"  # Still needed for logging and error messages
 
     with ThreadPoolExecutor(max_workers=2, initializer=init_worker, initargs=(count(1),)) as executor:
         # Submit pagination and TOC creation to run in parallel
@@ -1716,34 +1657,20 @@ def _assemble_final_bundle(
         return None
 
     # Return the path to the docx and the list of all temp files created in this function
-    return docx_output_path, [
-        merged_paginated_no_toc,
-        page_numbers_pdf,
-        page_numbers_aux,
-        page_numbers_tex,
-        toc_file_path,
-        toc_out,
-        toc_log,
-        toc_aux,
-        toc_tex,
-        merged_file_with_frontmatter,
-        hyperlinked_file,
-        main_bookmarked_file,
-        index_bookmarked_file,
-    ]
+    return docx_output_path, []  # No intermediate files are created anymore
 
 
-def create_bundle(input_files: list, output_file, coversheet_file, index_file, bundle_config_data: BundleConfig):
+def create_bundle(input_files: list, output_file, coversheet_file, csv_index_content: str | None, bundle_config_data: BundleConfig):
     """Create a bundle from input files and configuration."""
     docx_output_path = None
 
     bundle_config, temp_path, tmp_output_file, coversheet_pdf_obj, initial_temp_files = _initialize_bundle_creation(
-        bundle_config_data, output_file, coversheet_file, input_files, index_file
+        bundle_config_data, output_file, coversheet_file, input_files, None
     )
 
     try:
         index_data, toc_entries, merged_pdf_obj, main_page_count, is_bundle_map = _process_index_and_merge(
-            bundle_config, index_file, temp_path, input_files
+            bundle_config, csv_index_content, temp_path, input_files
         )
         if not merged_pdf_obj:
             bundle_logger.error("Merging process failed, merged PDF object is None.")
@@ -1799,7 +1726,6 @@ def create_bundle(input_files: list, output_file, coversheet_file, index_file, b
                     casenameforfilename,
                     zip_timestamp,
                     input_files,
-                    index_file,
                     docx_output_path,
                     temp_path,
                     tmp_output_file,
@@ -1830,7 +1756,6 @@ class CreateZipFileParams(NamedTuple):
     case_name: str
     timestamp: str
     input_files: list
-    csv_path: str
     docx_path: Path | None
     temp_path: Path
     tmp_output_file: str
@@ -1841,10 +1766,10 @@ def create_zip_file(create_zip_file_params: CreateZipFileParams):
 
     for the user's reproducability and record keeping.
     """
-    (bundle_title, case_name, timestamp, input_files, csv_path, docx_path, temp_dir, tmp_output_file) = create_zip_file_params
+    (bundle_title, case_name, timestamp, input_files, docx_path, temp_dir, tmp_output_file) = create_zip_file_params
 
     # int_zip_filepath = os.path.join(temp_dir, zip_filename)
-    int_zip_filepath = Path(temp_dir) / f"{bundle_title}_{case_name}_{timestamp}.zip"
+    int_zip_filepath = Path(temp_dir) / f"{secure_filename(bundle_title)}_{secure_filename(case_name)}_{timestamp}.zip"
     bundle_logger.debug(f"[CZF]Creating zip file at {int_zip_filepath}")
 
     with zipfile.ZipFile(int_zip_filepath, cast(Any, "w")) as zipf:
@@ -1853,14 +1778,9 @@ def create_zip_file(create_zip_file_params: CreateZipFileParams):
             # Since we have the file in memory, we write its content directly
             file_storage.stream.seek(0)
             zipf.writestr(f"input_files/{file_storage.filename}", file_storage.stream.read())
-        # Add CSV index to the root directory
-        if csv_path:
-            zipf.write(csv_path, Path(csv_path).name)
         # Add coversheet to the root directory
         if docx_path:
             zipf.write(docx_path, Path(docx_path).name)
-        # coversheet_path is no longer a path, so we can't add it directly.
-        # This part of the logic might need rethinking if saving the original coversheet is required.
         # Add outputfile (whole bundle) to the root directory
         if tmp_output_file and Path(tmp_output_file).exists():
             zipf.write(tmp_output_file, Path(tmp_output_file).name)
@@ -1891,8 +1811,7 @@ def main():
     input_files = args.input_files
     output_file = secure_filename(args.output_file) if args.output_file else secure_filename(f"{args.bundlename}-{timestamp}.pdf")
     coversheet = args.coversheet
-    index_file = args.index
-    csv_index = args.csv_index
+    csv_index_content = args.csv_index
     confidential_bool = args.confidential
     zip_bool = args.zip if args.zip else False
 
@@ -1900,7 +1819,7 @@ def main():
         BundleConfigParams(
             timestamp=timestamp,
             case_details={"bundle_title": args.bundlename, "claim_no": args.claimno, "case_name": args.casename},
-            csv_string=csv_index,
+            csv_string=csv_index_content,
             confidential_bool=confidential_bool,
             zip_bool=zip_bool,
             session_id=timestamp,
@@ -1919,7 +1838,7 @@ def main():
         input_files,  # For CLI, this would need to be a list of file paths opened as streams
         output_file,
         coversheet,
-        index_file,
+        csv_index_content,  # Pass the in-memory CSV content
         bundle_config,
     )
 
