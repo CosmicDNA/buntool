@@ -37,7 +37,8 @@ dev = [
     "buntool[test]", # Includes all dependencies from the 'test' group,
     "pre-commit==4.5.0", # For managing pre-commit hooks
     "ruff==0.14.8",
-    "vulture==2.14"
+    "vulture==2.14",
+    "memory-profiler==0.61"
 ]
 
 [tool.ruff]
