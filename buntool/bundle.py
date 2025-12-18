@@ -32,8 +32,7 @@
 import argparse
 import csv
 import functools
-
-# import gc
+import gc
 import io
 import logging
 import os
@@ -53,7 +52,7 @@ from typing import Any, Literal, NamedTuple, cast
 import pdfplumber
 
 try:
-    from memory_profiler import profile
+    from memory_profiler import profile  # type: ignore
 except ImportError:
 
     def profile(func):
@@ -151,6 +150,8 @@ def configure_logger(bundle_config: BundleConfig, session_id=None):
 
     # Clear existing handlers to prevent duplicate logs on subsequent runs
     if bundle_logger.hasHandlers():
+        for handler in bundle_logger.handlers:
+            handler.close()
         bundle_logger.handlers.clear()
 
     bundle_logger.setLevel(logging.DEBUG)
@@ -342,13 +343,29 @@ def get_and_adjust_bookmarks(pdf: Pdf, page_offset: int, pdf_name_for_logging: s
 
         def get_page_index_from_destination(dest):
             """Safely get the page index from a bookmark destination."""
-            if isinstance(dest, (list, Array)) and dest:
-                page_obj = dest[0]
-                if isinstance(page_obj, Page):
-                    return pdf.pages.index(page_obj)
+            page_to_find = None
+            if isinstance(dest, Page):
+                page_to_find = dest
+            elif isinstance(dest, (list, Array)) and dest:
+                page_obj_ref = dest[0]
+                # It's most likely a pikepdf.Object representing the page dictionary
+                if hasattr(page_obj_ref, "get") and page_obj_ref.get("/Type") == Name.Page:
+                    page_to_find = Page(page_obj_ref)
+
+            if page_to_find:
+                try:
+                    return pdf.pages.index(page_to_find)
+                except ValueError:
+                    bundle_logger.warning(f"Bookmark destination page not found in {pdf_name_for_logging}")
+                    return -1
+
             if isinstance(dest, int):
                 return dest
-            return -1  # Should not happen due to the check in _flatten_bookmarks
+
+            if dest is not None:
+                bundle_logger.debug(f"Unsupported bookmark destination type in {pdf_name_for_logging}: {type(dest)}")
+
+            return -1
 
         with pdf.open_outline() as outline:
             # Use a list comprehension to process the flattened bookmarks
@@ -385,7 +402,7 @@ def is_bundle(plumber_pdf: PDF, start_page: int = 0) -> int:
 
 
 @profile
-def _process_pdf_file(file_storage: FileStorage, coversheet_length: int = 0) -> dict:  # file_storage is a werkzeug.FileStorage
+def _process_pdf_file(file_storage: FileStorage) -> dict:  # file_storage is a werkzeug.FileStorage
     """Worker function to process a single PDF file in a thread.
 
     Opens the file with both pikepdf and pdfplumber to perform all
@@ -399,7 +416,7 @@ def _process_pdf_file(file_storage: FileStorage, coversheet_length: int = 0) -> 
         src_pdf = Pdf.open(cast(io.BytesIO, file_storage.stream))
         file_storage.stream.seek(0)  # Rewind again for pdfplumber
         with pdfplumber.open(cast(io.BytesIO, file_storage.stream)) as plumber_pdf:
-            is_nested_bundle = is_bundle(plumber_pdf, coversheet_length)
+            is_nested_bundle = is_bundle(plumber_pdf)
 
         sub_bookmarks = get_and_adjust_bookmarks(src_pdf, 0, cast(str, file_storage.filename))  # Offset is adjusted later
     except Exception as e:
@@ -414,12 +431,10 @@ def _process_pdf_file(file_storage: FileStorage, coversheet_length: int = 0) -> 
     finally:
         if src_pdf:
             src_pdf.close()
-        # # Force garbage collection to clean up potential heavy objects from pdfplumber
-        # gc.collect()
 
 
 @profile
-def merge_pdfs_create_toc_entries(input_files: list[FileStorage], index_data: dict, coversheet_length: int = 0):
+def merge_pdfs_create_toc_entries(input_files: list[FileStorage], index_data: dict):
     """Merge PDFs and create table of contents entries.
 
     index_data is the roadmap for the bundle creation.
@@ -451,7 +466,7 @@ def merge_pdfs_create_toc_entries(input_files: list[FileStorage], index_data: di
         }
 
         # Submit all PDF processing tasks to the executor
-        future_to_file = {executor.submit(_process_pdf_file, file, coversheet_length): file for file in files_to_process}
+        future_to_file = {executor.submit(_process_pdf_file, file): file for file in files_to_process}
 
         for future in as_completed(future_to_file):
             result = future.result()
@@ -598,7 +613,7 @@ def add_bookmarks_to_pdf(pdf: Pdf, toc_entries: list, length_of_frontmatter: int
             else:
                 # This is a file entry.
                 bookmark_item = _create_bookmark_item(entry, length_of_frontmatter, bundle_config)
-                main_bookmark_map[bookmark_item.title] = bookmark_item
+                main_bookmark_map[f"{entry[0]} {entry[1]}"] = bookmark_item
                 if current_section_bookmark:
                     current_section_bookmark.children.append(bookmark_item)
                 else:
@@ -1120,7 +1135,7 @@ def transform_coordinates(coords, page_height):
     # Flip the y coordinates by subtracting from page height. Ensure consistent types.
     new_y1 = page_height - y2  # Note: we swap y1 and y2 here
     new_y2 = page_height - y1
-    return (x1, new_y1, x2, new_y2)
+    return (x1, new_y2, x2, new_y1)
 
 
 def add_annotations_with_transform(pdf: Pdf, list_of_annotation_coords: list):
@@ -1142,17 +1157,17 @@ def add_annotations_with_transform(pdf: Pdf, list_of_annotation_coords: list):
                 toc_page.Annots = Array()
 
             # Create and append all annotations for this page
-            # using a generator expression inside extend.
-            toc_page.Annots.extend(
-                Dictionary(
-                    Type=Name.Annot,
-                    Subtype=Name.Link,
-                    Rect=Rectangle(*transform_coordinates(details["coords"], page_height)),
-                    Border=[0, 0, 0],
-                    Dest=[pdf.pages[details["destination_page"]].obj, Name.Fit],
+            for details in annotation_group:
+                dest_page_idx = details["destination_page"]
+                toc_page.Annots.append(
+                    Dictionary(
+                        Type=Name.Annot,
+                        Subtype=Name.Link,
+                        Rect=Rectangle(*transform_coordinates(details["coords"], page_height)),
+                        Border=[0, 0, 0],
+                        Dest=[pdf.pages[dest_page_idx].obj, Name.Fit],
+                    )
                 )
-                for details in annotation_group
-            )
 
             bundle_logger.debug(f"[AAWT]Added {len(annotation_group)} annotations to TOC page {toc_page_idx}")
 
@@ -1177,12 +1192,15 @@ def _find_match_for_entry(entry, scraped_pages_text, length_of_coversheet, lengt
         for line in page_lines:
             line_text = str(line.get("text", ""))
             if line_text.strip().startswith(tab_to_find):
-                bundle_logger.debug(f"[HYP]......SUCCESS: Found tab '{tab_to_find}' on page {page_idx} in line: '{line_text}'")
+                dest_page = int(entry[3]) + length_of_frontmatter
+                bundle_logger.debug(
+                    f"[HYP]......SUCCESS: Found tab '{tab_to_find}' on page {page_idx} in line: '{line_text}'. Calculated Dest Page: {dest_page}"
+                )
                 return {
                     "title": entry[1],
                     "toc_page": page_idx,
                     "coords": (line["x0"], line["bottom"], line["x1"], line["top"]),
-                    "destination_page": int(entry[3]) + length_of_frontmatter,
+                    "destination_page": dest_page,
                 }
     bundle_logger.warning(f"[HYP]......FAILURE: No match found for tab '{tab_to_find}'")
     return None
@@ -1220,7 +1238,7 @@ def _initialize_bundle_creation(bundle_config_data: BundleConfig, output_file, c
 
 
 def _process_index_and_merge(
-    bundle_config: BundleConfig, index_file, temp_path: Path, input_files: list, coversheet_length: int = 0
+    bundle_config: BundleConfig, index_file, temp_path: Path, input_files: list[FileStorage]
 ) -> tuple[dict[str, Any] | None, list | None, Pdf | None, int | None, dict[str, int] | None]:
     """Process index data and merge input PDFs. Returns index data, toc entries, and a list of temp files."""
     if not index_file and bundle_config.csv_string:
@@ -1244,9 +1262,7 @@ def _process_index_and_merge(
         ....index_data: {index_data}"""
     dedent_and_log(bundle_logger, log_msg)
     try:
-        merged_pdf_obj, toc_entries, all_sub_bookmarks, is_bundle_map, main_page_count = merge_pdfs_create_toc_entries(
-            input_files, index_data, coversheet_length
-        )
+        merged_pdf_obj, toc_entries, all_sub_bookmarks, is_bundle_map, main_page_count = merge_pdfs_create_toc_entries(input_files, index_data)
     except Exception:
         bundle_logger.exception("[CB]Error while merging pdf files")
         raise
@@ -1422,13 +1438,14 @@ def _adjust_inner_bundle_links(pdf: Pdf, toc_entries: list, index_data: dict, le
             # The links are on the TOC pages of the inner bundle.
             # These pages are located at the beginning of where the inner bundle was placed.
             for i in range(num_toc_pages):
-                page_to_adjust = pdf.pages[final_start_page + i]
-                for annot in page_to_adjust.get("/Annots", []):
+                page_to_adjust: Page = pdf.pages[final_start_page + i]
+                annots = cast(list[Dictionary], page_to_adjust.get("/Annots"))
+                for annot in annots or []:
                     if annot.get("/Subtype") == "/Link" and annot.Dest:
                         # The destination is an indirect object. We can't just add to it.
                         # We need to find the original destination page index and create a new destination.
-                        original_dest_page_obj = annot.Dest[0]
-                        new_dest_page_index = pdf.pages.index(original_dest_page_obj) + final_start_page
+                        original_dest_page_obj = cast(Page, annot.Dest[0])
+                        new_dest_page_index = pdf.pages.index(original_dest_page_obj)
                         annot.Dest = Array([pdf.pages[new_dest_page_index].obj, Name.Fit])
 
 
@@ -1754,15 +1771,15 @@ def create_bundle(
     """Create a bundle from input files and configuration."""
     docx_output_path = None
     merged_pdf_obj = None
+    coversheet_pdf_obj = None
 
     bundle_config, temp_path, tmp_output_file, coversheet_pdf_obj = _initialize_bundle_creation(
         bundle_config_data, output_file, coversheet_file, input_files
     )
 
-    coversheet_length = len(coversheet_pdf_obj.pages) if coversheet_pdf_obj else 0
     try:
         index_data, toc_entries, merged_pdf_obj, main_page_count, is_bundle_map = _process_index_and_merge(
-            bundle_config, csv_index_content, temp_path, input_files, coversheet_length
+            bundle_config, csv_index_content, temp_path, input_files
         )
         if not merged_pdf_obj:
             bundle_logger.error("Merging process failed, merged PDF object is None.")
@@ -1801,11 +1818,14 @@ def create_bundle(
     finally:
         if merged_pdf_obj:
             merged_pdf_obj.close()
+        if coversheet_pdf_obj:
+            coversheet_pdf_obj.close()
 
     # Create zip file if requested:
     zip_filepath = _handle_zip_creation(bundle_config, input_files, docx_output_path, temp_path, tmp_output_file)
 
     final_zip_path = str(zip_filepath) if zip_filepath else None
+    gc.collect()
     return str(tmp_output_file), final_zip_path
 
 

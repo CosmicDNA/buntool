@@ -16,6 +16,8 @@ from werkzeug.datastructures import FileStorage
 from buntool import bundle
 from buntool.bundle_config import BundleConfigParams
 
+# from buntool.trace_malloc import TraceMalloc
+
 # import boto3
 
 # def upload_to_s3(file_path, s3_key):
@@ -219,7 +221,10 @@ def create_bundle():
             ....bundle_config elements: {bundle_config.__dict__}"""
         current_app.logger.info(textwrap.dedent(log_msg))
 
+        # tm = TraceMalloc(current_app.logger)
         received_output_file, zip_file_path = bundle.create_bundle(files, output_file, coversheet_file, None, bundle_config)
+        # tm.log()
+
         t2 = datetime.now()
 
         delta = t2 - t1
