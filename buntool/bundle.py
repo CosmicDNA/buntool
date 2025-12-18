@@ -38,6 +38,7 @@ import logging
 import re
 import textwrap
 import zipfile
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from itertools import count, groupby
@@ -809,6 +810,79 @@ def _setup_reportlab_styles(main_font: str, bold_font: str, base_font_size: int)
     return styleSheet
 
 
+def _build_reportlab_doc_header(casedetails: dict, styleSheet: StyleSheet1, confidential: bool) -> list[Table]:
+    """Builds the header tables (claim no, case name, bundle title) for the ReportLab TOC."""
+    # Claim No table - top right
+    claimno_table_data = [
+        [Paragraph(casedetails.get("claim_no", ""), styleSheet["claimno_style"])],
+    ]
+    claimno_table = Table(
+        data=claimno_table_data,
+        colWidths=PAGE_WIDTH * 0.9,
+        rowHeights=1.5 * cm,
+    )
+    claimno_table.setStyle(
+        TableStyle(
+            [
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 50),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ("VALIGN", (0, 0), (-1, -1), "BOTTOM"),
+            ]
+        )
+    )
+
+    # Case name and bundle title table
+    if not confidential:
+        header_table_data = [
+            ["", Paragraph(casedetails.get("case_name", ""), styleSheet["case_name_style"]), ""],
+            ["", Paragraph(casedetails.get("bundle_title", ""), styleSheet["bundle_title_style"]), ""],
+        ]
+    else:
+        header_table_data = [
+            ["", Paragraph(casedetails.get("case_name", ""), styleSheet["case_name_style"]), ""],
+            ["", Paragraph(f'<font color="red">CONFIDENTIAL</font> {casedetails.get("bundle_title", "")}', styleSheet["bundle_title_style"]), ""],
+        ]
+    header_table = Table(header_table_data, colWidths=[PAGE_WIDTH / 8, PAGE_WIDTH * (6 / 8), PAGE_WIDTH / 8])
+    header_table.setStyle(
+        TableStyle(
+            [
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("ALIGN", (2, 0), (2, 0), "RIGHT"),
+                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+                ("SIZE", (0, 0), (-1, -1), 10),
+                ("LINEBELOW", (1, 1), (1, 1), 1, colors.black),
+                ("LINEABOVE", (1, 1), (1, 1), 1, colors.black),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
+            ]
+        )
+    )
+    return [claimno_table, header_table]
+
+
+def _build_reportlab_main_table(table_data, list_of_section_breaks, col_widths):
+    """Builds and styles the main TOC table for ReportLab."""
+    toc_table = Table(table_data, colWidths=col_widths, repeatRows=1, cornerRadii=(5, 5, 0, 0))
+    style = TableStyle(
+        [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.darkgray),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+            ("LINEBELOW", (0, 0), (-1, 0), 1, colors.black),
+            ("ALIGNMENT", (0, 0), (-1, 0), "CENTRE"),
+            ("FONTSIZE", (0, 0), (-1, 0), 12),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+            ("LINEBELOW", (0, 1), (-1, -1), 0.3, colors.black),
+        ]
+    )
+    for section_break_row in list_of_section_breaks:
+        style.add("BACKGROUND", (0, int(section_break_row)), (-1, int(section_break_row)), colors.lightgrey)
+    toc_table.setStyle(style)
+    return toc_table
+
+
 def create_toc_pdf_reportlab(toc_entries, bundle_config: BundleConfig, output_file, options: dict) -> int:
     """Generate a table of contents PDF using ReportLab."""
     casedetails = bundle_config.case_details
@@ -824,121 +898,22 @@ def create_toc_pdf_reportlab(toc_entries, bundle_config: BundleConfig, output_fi
     page_offset = 1 + (0 if options.get("dummy") else bundle_config.expected_length_of_frontmatter)
     styleSheet = _setup_reportlab_styles(main_font, bold_font, base_font_size)
 
-    # Now, position each element within a table.
-    # There are three tables: Claim no, [Case title, bundle title], and [toc_entries]
-    # Each table is defined by:
-    #  - define data to go into the table;
-    #  - define the table itself; and #  - set the style of the table.
-    # Finally, they are passed as elements to the builder function.
     reportlab_pdf = SimpleDocTemplate(
         str(output_file), pagesize=A4, rightMargin=1.5 * cm, leftMargin=1.5 * cm, topMargin=1 * cm, bottomMargin=1.5 * cm
     )
 
-    reportlab_pdf = SimpleDocTemplate(
-        str(output_file), pagesize=A4, rightMargin=1.5 * cm, leftMargin=1.5 * cm, topMargin=1 * cm, bottomMargin=1.5 * cm
-    )
+    # Build header elements
+    header_elements = _build_reportlab_doc_header(casedetails, styleSheet, options.get("confidential", False))
 
-    # Claim No table - top right
-    claimno_table_data = [
-        [Paragraph(casedetails.get("claim_no", ""), styleSheet["claimno_style"])],  # Claim No
-    ]
-    claimno_table = Table(
-        data=claimno_table_data,
-        colWidths=PAGE_WIDTH * 0.9,
-        rowHeights=1.5 * cm,
-    )
-    claimno_table.setStyle(
-        TableStyle(
-            [
-                ("LEFTPADDING", (0, 0), (-1, -1), 0),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 50),
-                ("TOPPADDING", (0, 0), (-1, -1), 0),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-                ("VALIGN", (0, 0), (-1, -1), "BOTTOM"),
-                # ('GRID', (0, 0), (-1, -1), 0.5, 'black'),
-            ]
-        )
-    )
-
-    bundle_title = casedetails.get("bundle_title", "")
-    # Now, the case name and bundle title:
-    if not options.get("confidential"):
-        header_table_data = [
-            ["", Paragraph(casedetails.get("case_name", ""), styleSheet["case_name_style"]), ""],  # Case Name
-            ["", Paragraph(bundle_title, styleSheet["bundle_title_style"]), ""],  # Bundle Title
-        ]
-    else:
-        header_table_data = [
-            ["", Paragraph(casedetails.get("case_name", ""), styleSheet["case_name_style"]), ""],  # Case Name
-            ["", Paragraph((f'<font color="red">CONFIDENTIAL</font> {casedetails.get("bundle_title", "")}'), styleSheet["bundle_title_style"]), ""],
-            # Bundle Title
-        ]
-    header_table = Table(header_table_data, colWidths=[PAGE_WIDTH / 8, PAGE_WIDTH * (6 / 8), PAGE_WIDTH / 8])  # aesthetic choice
-    header_table.setStyle(
-        TableStyle(
-            [
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("ALIGN", (2, 0), (2, 0), "RIGHT"),  # Align Claim No to the right
-                ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-                ("SIZE", (0, 0), (-1, -1), 10),
-                ("LINEBELOW", (1, 1), (1, 1), 1, colors.black),  # Underline Bundle Title
-                ("LINEABOVE", (1, 1), (1, 1), 1, colors.black),  # Overline Bundle Title
-                ("TOPPADDING", (0, 0), (-1, -1), 8),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 14),
-            ]
-        )
-    )
-
-    style_sheet = styleSheet
-
-    # Third, the main toc entries able:
+    # Build main TOC table
     reportlab_table_data, list_of_section_breaks = _build_reportlab_table_data(
-        TableDataParams(toc_entries, date_col_hdr, options.get("dummy"), page_offset, style_sheet, bundle_title)
+        TableDataParams(toc_entries, date_col_hdr, options.get("dummy"), page_offset, styleSheet, casedetails.get("bundle_title", ""))
     )
-    toc_table = Table(
-        reportlab_table_data,
-        colWidths=[1.3 * cm, title_col_width * cm, date_col_width * cm, page_col_width * cm],
-        repeatRows=1,
-        cornerRadii=(5, 5, 0, 0),
-    )
-    style = TableStyle(
-        [
-            # Style for header row:
-            ("BACKGROUND", (0, 0), (-1, 0), colors.darkgray),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-            ("LINEBELOW", (0, 0), (-1, 0), 1, colors.black),
-            # ('FONTNAME', (0, 0), (-1, 0Roman-), bold_fontname),
-            ("ALIGNMENT", (0, 0), (-1, 0), "CENTRE"),
-            ("FONTSIZE", (0, 0), (-1, 0), 12),
-            # rest of table:
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("BACKGROUND", (0, 1), (-1, -1), colors.white),
-            ("LINEBELOW", (0, 1), (-1, -1), 0.3, colors.black),
-            # paint section breaks with grey background:
-        ]
-    )
-    for section_break_row in list_of_section_breaks:
-        style.add("BACKGROUND", (0, int(section_break_row)), (-1, int(section_break_row)), colors.lightgrey)
-
-    toc_table.setStyle(style)
-
-    # Now, add a footer with the page number. Use a single-cell table at the bottom of the page:
-    # current page number:
-
-    # footer_frame = Frame (
-    #     PAGE_WIDTH*0.2, 1*cm, #x, y lower left
-    #     PAGE_WIDTH*0.8, 1.5*cm, #box width and height
-    #     leftPadding=6,
-    #     bottomPadding=6,
-    #     rightPadding=6,
-    #     topPadding=6,
-    #     id="footerframe",
-    #     showBoundary=1
-    # )
-    # footer_frame.add("Blob", reportlab_pdf)
+    col_widths = [1.3 * cm, title_col_width * cm, date_col_width * cm, page_col_width * cm]
+    toc_table = _build_reportlab_main_table(reportlab_table_data, list_of_section_breaks, col_widths)
 
     # Now, build the pdf:
-    elements = [claimno_table, header_table, Spacer(1, 1 * cm), toc_table]
+    elements: Sequence[Flowable] = list(header_elements + [Spacer(1, 1 * cm), toc_table])
 
     def _get_coversheet_length(coversheet_path: Path) -> int:
         """Safely get the number of pages in a coversheet PDF."""
@@ -1477,6 +1452,7 @@ def _adjust_inner_bundle_links(pdf: Pdf, toc_entries: list, index_data: dict, le
                     if annot.get("/Subtype") == "/Link" and annot.Dest:
                         annot.Dest[0] += final_start_page
 
+
 class AssembleFinalBundleParams(NamedTuple):
     bundle_config: BundleConfig
     temp_path: Path
@@ -1655,6 +1631,37 @@ def save_merged_files_with_frontmaster(params: SaveMergedFilesWithFrontmasterPar
     return frontmatter_path, length_of_frontmatter
 
 
+def _calculate_hyperlink_coords(
+    merged_file_with_frontmatter: Path, length_of_coversheet: int | None, length_of_frontmatter: int, toc_entries: list
+) -> list:
+    """Calculates the coordinates for TOC hyperlinks by extracting text in parallel."""
+    bundle_logger.debug("[HYP]Starting hyperlink coordinate calculation")
+    with pdfplumber.open(merged_file_with_frontmatter) as pdf, ThreadPoolExecutor() as executor:
+        num_pages_in_plumber_pdf = len(pdf.pages)
+        bundle_logger.debug(f"[HYP]..Opened {merged_file_with_frontmatter.name} with pdfplumber. It has {num_pages_in_plumber_pdf} pages.")
+        bundle_logger.debug(f"[HYP]..Coversheet length: {length_of_coversheet}, Frontmatter length: {length_of_frontmatter}")
+
+        toc_page_indices = range(length_of_coversheet if length_of_coversheet is not None else 0, length_of_frontmatter)
+        future_to_page = {executor.submit(get_scraped_pages_text, pdf, idx): idx for idx in toc_page_indices}
+
+        results_dict = {}
+        for future in as_completed(future_to_page):
+            page_idx = future_to_page[future]
+            results_dict[page_idx] = future.result()
+        scraped_pages_text = [results_dict[i] for i in sorted(results_dict.keys())]
+
+    return [
+        match
+        for entry in toc_entries
+        if "SECTION_BREAK" not in entry[0] and not (len(entry) > MIN_TOC_ENTRY_FIELDS and str(entry[3]) == "Page")
+        if (
+            match := _find_match_for_entry(
+                entry, scraped_pages_text, length_of_coversheet if length_of_coversheet is not None else 0, length_of_frontmatter
+            )
+        )
+    ]
+
+
 def _assemble_final_bundle(
     assemble_final_bundle_params: AssembleFinalBundleParams,
 ):
@@ -1733,36 +1740,7 @@ def _assemble_final_bundle(
         bundle_logger.exception("CB..Saving merged files with frontmatter failed.")
         return None
 
-    # Calculate hyperlink coordinates before opening the PDF for modification
-    bundle_logger.debug("[HYP]Starting hyperlink coordinate calculation")
-    with pdfplumber.open(merged_file_with_frontmatter) as pdf, ThreadPoolExecutor() as executor:
-        num_pages_in_plumber_pdf = len(pdf.pages)
-        bundle_logger.debug(f"[HYP]..Opened {merged_file_with_frontmatter.name} with pdfplumber. It has {num_pages_in_plumber_pdf} pages.")
-        bundle_logger.debug(f"[HYP]..Coversheet length: {length_of_coversheet}, Frontmatter length: {length_of_frontmatter}")
-
-        toc_page_indices = range(length_of_coversheet if length_of_coversheet is not None else 0, length_of_frontmatter)
-        # Submit text extraction tasks for each TOC page to run in parallel
-        future_to_page = {executor.submit(get_scraped_pages_text, pdf, idx): idx for idx in toc_page_indices}
-
-        # Collect the results into a dictionary, mapping page index to its text as they complete
-        # Collect the results into a dictionary, mapping page index to its text
-        results_dict = {}
-        for future in as_completed(future_to_page):
-            page_idx = future_to_page[future]
-            results_dict[page_idx] = future.result()
-        scraped_pages_text = [results_dict[i] for i in sorted(results_dict.keys())]
-        scraped_pages_text = [results_dict[i] for i in sorted(results_dict)]
-
-    list_of_annotation_coords = [
-        match
-        for entry in toc_entries
-        if "SECTION_BREAK" not in entry[0] and not (len(entry) > MIN_TOC_ENTRY_FIELDS and str(entry[3]) == "Page")
-        if (
-            match := _find_match_for_entry(
-                entry, scraped_pages_text, length_of_coversheet if length_of_coversheet is not None else 0, length_of_frontmatter
-            )
-        )
-    ]
+    list_of_annotation_coords = _calculate_hyperlink_coords(merged_file_with_frontmatter, length_of_coversheet, length_of_frontmatter, toc_entries)
 
     try:
         with Pdf.open(merged_file_with_frontmatter, allow_overwriting_input=True) as pdf:
