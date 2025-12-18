@@ -300,7 +300,7 @@ def _generate_toc_entry(toc_entry_params: TocEntryParams) -> tuple | None:
     section_counts = toc_entry_params.section_counts
     pdf = toc_entry_params.pdf
 
-    filename, (title, _, section) = item
+    _, (title, _, section) = item
 
     if section == "1":
         section_num = next(section_counts)
@@ -322,15 +322,12 @@ def _generate_toc_entry(toc_entry_params: TocEntryParams) -> tuple | None:
     return (tab_number, entry_title, entry_date, current_page_start)
 
 
-def get_and_adjust_bookmarks(pdf: Pdf, page_offset: int, pdf_name_for_logging: str) -> list[tuple[str, int, int]]:
-    """Reads a PDF's bookmarks, adjusts their page destinations by an offset.
-
-    And returns them as a list of (title, page_number, level) tuples.
-    """
-    adjusted_bookmarks = []
+def extract_bookmarks(pdf: Pdf, pdf_name_for_logging: str) -> list[tuple[str, int, int]]:
+    """Reads a PDF's bookmarks and returns them as a list of (title, page_number, level) tuples."""
+    extracted_bookmarks = []
     try:
         if not pdf.Root.get("/Outlines"):
-            bundle_logger.debug(f" - No bookmarks found in '{pdf_name_for_logging}' to adjust.")
+            bundle_logger.debug(f" - No bookmarks found in '{pdf_name_for_logging}'.")
             return []
 
         def _flatten_bookmarks(items: list[OutlineItem], level=0):
@@ -368,19 +365,18 @@ def get_and_adjust_bookmarks(pdf: Pdf, page_offset: int, pdf_name_for_logging: s
             return -1
 
         with pdf.open_outline() as outline:
-            # Use a list comprehension to process the flattened bookmarks
-            adjusted_bookmarks = [
-                (item.title, get_page_index_from_destination(item.destination) + page_offset, level)
+            extracted_bookmarks = [
+                (item.title, page_index, level)
                 for item, level in _flatten_bookmarks(outline.root)
-                if get_page_index_from_destination(item.destination) != -1
+                if (page_index := get_page_index_from_destination(item.destination)) != -1
             ]
 
-        bundle_logger.info(f"Found and adjusted {len(adjusted_bookmarks)} bookmarks in {pdf_name_for_logging}")
-        for title, new_page, level in adjusted_bookmarks:
-            bundle_logger.debug(f" - Bookmark '{title}' at level {level} adjusted to page {new_page}")
+        bundle_logger.info(f"Found {len(extracted_bookmarks)} bookmarks in {pdf_name_for_logging}")
+        for title, page, level in extracted_bookmarks:
+            bundle_logger.debug(f" - Bookmark '{title}' at level {level} points to page {page}")
     except Exception:
-        bundle_logger.exception(f"Error reading and adjusting bookmarks from {pdf_name_for_logging}")
-    return adjusted_bookmarks
+        bundle_logger.exception(f"Error reading bookmarks from {pdf_name_for_logging}")
+    return extracted_bookmarks
 
 
 def is_bundle(plumber_pdf: PDF, start_page: int = 0) -> int:
@@ -418,7 +414,7 @@ def _process_pdf_file(file_storage: FileStorage) -> dict:  # file_storage is a w
         with pdfplumber.open(cast(io.BytesIO, file_storage.stream)) as plumber_pdf:
             is_nested_bundle = is_bundle(plumber_pdf)
 
-        sub_bookmarks = get_and_adjust_bookmarks(src_pdf, 0, cast(str, file_storage.filename))  # Offset is adjusted later
+        sub_bookmarks = extract_bookmarks(src_pdf, cast(str, file_storage.filename))
     except Exception as e:
         bundle_logger.exception(f"Error processing file {file_storage.filename}")
         return {"error": str(e), "filename": file_storage.filename}
@@ -1157,17 +1153,18 @@ def add_annotations_with_transform(pdf: Pdf, list_of_annotation_coords: list):
                 toc_page.Annots = Array()
 
             # Create and append all annotations for this page
-            for details in annotation_group:
-                dest_page_idx = details["destination_page"]
-                toc_page.Annots.append(
+            toc_page.Annots.extend(
+                [
                     Dictionary(
                         Type=Name.Annot,
                         Subtype=Name.Link,
                         Rect=Rectangle(*transform_coordinates(details["coords"], page_height)),
                         Border=[0, 0, 0],
-                        Dest=[pdf.pages[dest_page_idx].obj, Name.Fit],
+                        Dest=[pdf.pages[details["destination_page"]].obj, Name.Fit],
                     )
-                )
+                    for details in annotation_group
+                ]
+            )
 
             bundle_logger.debug(f"[AAWT]Added {len(annotation_group)} annotations to TOC page {toc_page_idx}")
 
