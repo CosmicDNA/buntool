@@ -12,7 +12,6 @@ from colorlog import ColoredFormatter
 from flask import Flask, current_app, jsonify, render_template, request, send_file
 from waitress import serve
 from werkzeug.datastructures import FileStorage
-from werkzeug.utils import secure_filename
 
 from buntool import bundle
 from buntool.bundle_config import BundleConfigParams
@@ -27,7 +26,6 @@ from buntool.bundle_config import BundleConfigParams
 
 # Constants
 MAX_FILENAME_LENGTH = 100
-MIN_CSV_COLUMNS_FOR_SECTION_CHECK = 4
 
 
 @dataclass
@@ -99,18 +97,6 @@ def _get_bundle_config_from_form(form: dict, context: RequestContext, logs_dir: 
     )
 
 
-def save_uploaded_file(file: FileStorage, directory, filename=None):
-    """Saves a file from a request to a specified directory."""
-    if not (file and file.filename):
-        return None
-    name_to_secure = filename if filename else file.filename
-    secure_name = secure_filename(name_to_secure)
-    filepath = Path(directory) / secure_name
-    file.save(filepath)
-    current_app.logger.debug(f"Saved file: {filepath}")
-    return filepath
-
-
 def _get_coversheet_file(request_files: dict[str, FileStorage]) -> FileStorage | None:
     """Gets the coversheet FileStorage object from the request if it exists."""
     if "coversheet" in request_files and request_files["coversheet"].filename != "":
@@ -119,20 +105,19 @@ def _get_coversheet_file(request_files: dict[str, FileStorage]) -> FileStorage |
     return None
 
 
-def _handle_csv_index_upload(request_files: dict[str, FileStorage], temp_dir: Path, session_id: str, timestamp: str):
-    """Handles CSV index upload, sanitization, and returns the path to the sanitized CSV."""
+def _handle_csv_index_upload(request_files: dict[str, FileStorage]):
+    """Handles CSV index upload and returns its content as a string."""
     if "csv_index" in request_files and request_files["csv_index"].filename:
         csv_file = request_files["csv_index"]
-        secure_csv_filename = f"index_{session_id}_{timestamp}.csv"
-        saved_csv_path = save_uploaded_file(csv_file, temp_dir, secure_csv_filename)
-
-        if not saved_csv_path or not Path(saved_csv_path).exists():
-            msg = f"Index data did not upload correctly. Session code: {session_id}"
-            current_app.logger.error(f"CSV file not found or failed to save at path: {saved_csv_path}")
+        try:
+            # Read the content of the file stream directly into a string
+            csv_content = csv_file.stream.read().decode("utf-8")
+        except Exception as e:
+            msg = f"Could not read uploaded CSV index: {e}"
+            current_app.logger.exception(msg)  # Use .exception for logging with traceback
             # We return a tuple (error_response, None) to be handled by the caller
             return jsonify({"status": "error", "message": msg}), 400, None
-
-        return None, None, saved_csv_path
+        return None, None, csv_content
 
     return None, None, None
 
@@ -220,21 +205,21 @@ def create_bundle():
 
         coversheet_file = _get_coversheet_file(request.files)
 
-        error_response, status_code, sanitised_filenames_index_csv = _handle_csv_index_upload(request.files, temp_dir, session_id, timestamp)
+        error_response, status_code, csv_content_string = _handle_csv_index_upload(request.files)
         if error_response:
             # If status_code is None, default to 400
             return error_response if status_code is None else (error_response, status_code)
 
+        bundle_config.csv_string = csv_content_string or ""
         log_msg = f"""
             Calling buntool.create_bundle with params:
             ....input_files: {[f.filename for f in files]}
             ....output_file: {output_file}
             ....coversheet_file: {coversheet_file.filename if coversheet_file else "None"}
-            ....sanitised_filenames_index_csv: {sanitised_filenames_index_csv}
             ....bundle_config elements: {bundle_config.__dict__}"""
         current_app.logger.info(textwrap.dedent(log_msg))
 
-        received_output_file, zip_file_path = bundle.create_bundle(files, output_file, coversheet_file, sanitised_filenames_index_csv, bundle_config)
+        received_output_file, zip_file_path = bundle.create_bundle(files, output_file, coversheet_file, None, bundle_config)
         t2 = datetime.now()
 
         delta = t2 - t1

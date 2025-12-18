@@ -34,16 +34,19 @@ import csv
 import functools
 import io
 import logging
+import os
 
 # General
 import re
 import textwrap
+import threading
 import zipfile
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from itertools import count, groupby
 from pathlib import Path
-from typing import Any, NamedTuple, cast
+from typing import Any, Literal, NamedTuple, cast
 
 import pdfplumber
 
@@ -90,6 +93,27 @@ MIN_TOC_ENTRY_FIELDS = 3
 
 bundle_logger = logging.getLogger("bundle_logger")
 
+thread_local = threading.local()
+worker_id_counter = count(1)
+
+
+def init_worker(counter):
+    """Initializer for ThreadPoolExecutor workers to assign a unique ID."""
+    thread_local.worker_id = next(counter)
+
+
+class ThreadIdFormatter(ColoredFormatter):
+    """A custom logger formatter to automatically add a worker thread ID to log messages."""
+
+    def __init__(self, fmt=None, datefmt=None, style: Literal["%", "{", "$"] = "%", log_colors=None, reset=True):
+        super().__init__(fmt, datefmt, style, log_colors, reset)
+
+    def format(self, record):
+        # If the log record is from a worker thread, prepend its ID.
+        if hasattr(thread_local, "worker_id"):
+            record.msg = f"[T-{thread_local.worker_id}] {record.msg}"  # Prepend to the message
+        return super().format(record)
+
 
 def configure_logger(bundle_config, session_id=None):
     """Configure a logger for the bundling process.
@@ -116,15 +140,18 @@ def configure_logger(bundle_config, session_id=None):
 
     bundle_logger.setLevel(logging.DEBUG)
     bundle_logger.propagate = False
-    formatter = logging.Formatter("%(asctime)s-%(levelname)s-[BUN]: %(message)s")
-    color_formatter = ColoredFormatter(
-        "%(log_color)s%(asctime)s - %(levelname)s - [BUN]: %(message)s",
-        log_colors={"DEBUG": "cyan", "INFO": "green", "WARNING": "yellow", "ERROR": "red", "CRITICAL": "red,bg_white"},
-        reset=True,
-    )
+    # Use the new custom formatter
+    log_colors_config = {"DEBUG": "cyan", "INFO": "green", "WARNING": "yellow", "ERROR": "red", "CRITICAL": "red,bg_white"}
 
+    # Formatter for file output (no colors)
+    file_formatter = ThreadIdFormatter("%(asctime)s-%(levelname)s-[BUN]: %(message)s")
+    # Formatter for console output (with colors)
+    console_formatter = ThreadIdFormatter(
+        "%(log_color)s%(asctime)s - %(levelname)s - [BUN]: %(message)s%(reset)s",
+        log_colors=log_colors_config,
+    )
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(color_formatter)
+    console_handler.setFormatter(console_formatter)
     bundle_logger.addHandler(console_handler)
 
     if not session_id:
@@ -132,8 +159,8 @@ def configure_logger(bundle_config, session_id=None):
     # logs path = buntool_timestamp.log:
     logs_path = Path(logs_dir) / f"buntool_{session_id}.log"
     session_file_handler = logging.FileHandler(logs_path)
-    session_file_handler.setLevel(logging.DEBUG)
-    session_file_handler.setFormatter(formatter)
+    session_file_handler.setLevel(logging.DEBUG)  # Set level for file handler
+    session_file_handler.setFormatter(file_formatter)  # Use the file formatter
     logger.addHandler(session_file_handler)
     return bundle_logger
 
@@ -330,7 +357,7 @@ def get_and_adjust_bookmarks(pdf: Pdf, page_offset: int) -> list[tuple[str, int,
     adjusted_bookmarks = []
     try:
         if not pdf.Root.get("/Outlines"):
-            bundle_logger.debug(f"  - No bookmarks found in '{pdf.filename}' to adjust.")
+            bundle_logger.debug(f" - No bookmarks found in '{pdf.filename}' to adjust.")
             return []
 
         def _flatten_bookmarks(items, level=0):
@@ -361,7 +388,7 @@ def get_and_adjust_bookmarks(pdf: Pdf, page_offset: int) -> list[tuple[str, int,
 
         bundle_logger.info(f"Found and adjusted {len(adjusted_bookmarks)} bookmarks in {pdf.filename}")
         for title, new_page, level in adjusted_bookmarks:
-            bundle_logger.debug(f"  - Bookmark '{title}' at level {level} adjusted to page {new_page}")
+            bundle_logger.debug(f" - Bookmark '{title}' at level {level} adjusted to page {new_page}")
     except Exception:
         bundle_logger.exception(f"Error reading and adjusting bookmarks from {pdf.filename}")
     return adjusted_bookmarks
@@ -392,6 +419,7 @@ def _process_pdf_file(file_storage: Any) -> dict:  # file_storage is a werkzeug.
     necessary analysis and preparation for merging.
     """
     try:
+        bundle_logger.debug(f"Processing file {file_storage.filename}")
         # Ensure the stream is at the beginning before reading
         file_storage.stream.seek(0)
         src_pdf = Pdf.open(file_storage.stream)
@@ -436,7 +464,7 @@ def merge_pdfs_create_toc_entries(input_files, index_data: dict):
     is_bundle_map = {}  # To store results of is_bundle checks
     filename_to_results = {}
 
-    with ThreadPoolExecutor() as executor:
+    with ThreadPoolExecutor(max_workers=os.cpu_count(), initializer=init_worker, initargs=(count(1),)) as executor:
         # Map filenames from index_data to actual file paths
         files_to_process = {
             file
@@ -450,7 +478,6 @@ def merge_pdfs_create_toc_entries(input_files, index_data: dict):
         for future in as_completed(future_to_file):
             result = future.result()
             if "error" not in result:
-                # The filename from the result is already sanitized by the frontend
                 filename_to_results[result["filename"]] = result
 
     # Now, assemble the results sequentially
@@ -901,7 +928,7 @@ def create_toc_pdf_reportlab(toc_entries, bundle_config: BundleConfig, options: 
     toc_table = _build_reportlab_main_table(reportlab_table_data, list_of_section_breaks, col_widths)
 
     # Now, build the pdf:
-    elements: list[Flowable] = list(header_elements + [Spacer(1, 1 * cm), toc_table])
+    elements: Sequence[Flowable] = list(header_elements + [Spacer(1, 1 * cm), toc_table])
 
     def _get_coversheet_length(coversheet_path: Path) -> int:
         """Safely get the number of pages in a coversheet PDF."""
@@ -1316,7 +1343,7 @@ class TocParams(NamedTuple):  # Already defined
 
 class CreateTocError(Exception):
     def __init__(self, message="TOC PDF creation failed."):
-        super().__init__(message)
+        super().__init__("TOC creation future returned None." if message == "0" else message)
 
 
 def _create_toc(toc_params: TocParams):
@@ -1436,6 +1463,54 @@ class AssembleFinalBundleParams(NamedTuple):
     tmp_output_file: Path
 
 
+class PathsTuple(NamedTuple):
+    merged_paginated_no_toc: Path
+    page_numbers_pdf: Path
+    page_numbers_aux: Path
+    page_numbers_tex: Path
+    toc_file_path: Path
+    toc_out: Path
+    toc_log: Path
+    toc_aux: Path
+    toc_tex: Path
+    merged_file_with_frontmatter: Path
+    hyperlinked_file: Path
+    main_bookmarked_file: Path
+    index_bookmarked_file: Path
+
+
+def get_paths(temp_path: Path):
+    # Define all potential temporary file paths upfront
+    merged_paginated_no_toc = temp_path / "TEMP03_paginated_mainpages.pdf"
+    page_numbers_pdf = temp_path / "pageNumbers.pdf"
+    page_numbers_aux = temp_path / "pageNumbers.aux"
+    page_numbers_tex = temp_path / "pageNumbers.tex"
+    toc_file_path = temp_path / "index.pdf"
+    toc_out = temp_path / "index.out"
+    toc_log = temp_path / "index.log"
+    toc_aux = temp_path / "index.aux"
+    toc_tex = temp_path / "toc.tex"
+    merged_file_with_frontmatter = temp_path / "TEMP04_all_pages.pdf"
+    hyperlinked_file = temp_path / "TEMP05-hyperlinked.pdf"
+    main_bookmarked_file = temp_path / "TEMP06_main_bookmarks.pdf"
+    index_bookmarked_file = temp_path / "TEMP07_all_bookmarks.pdf"
+    return PathsTuple(
+        merged_paginated_no_toc,
+        page_numbers_pdf,
+        page_numbers_aux,
+        page_numbers_tex,
+        toc_file_path,
+        toc_out,
+        toc_log,
+        toc_aux,
+        toc_tex,
+        merged_file_with_frontmatter,
+        hyperlinked_file,
+        main_bookmarked_file,
+        index_bookmarked_file,
+    )
+
+
 class PaginationError(Exception):
     """Custom exception for pagination errors."""
 
@@ -1521,28 +1596,36 @@ def _calculate_hyperlink_coords(pdf_in_memory: Pdf, length_of_coversheet: int | 
     buffer.seek(0)  # Rewind the buffer to the beginning
 
     with pdfplumber.open(buffer) as pdf, ThreadPoolExecutor() as executor:
+        # Step 1: Parallelize the text extraction from each TOC page.
         bundle_logger.debug(f"[HYP]..Opened in-memory PDF with pdfplumber. It has {len(pdf.pages)} pages.")
         bundle_logger.debug(f"[HYP]..Coversheet length: {length_of_coversheet}, Frontmatter length: {length_of_frontmatter}")
 
         toc_page_indices = range(length_of_coversheet if length_of_coversheet is not None else 0, length_of_frontmatter)
-        future_to_page = {executor.submit(get_scraped_pages_text, pdf, idx): idx for idx in toc_page_indices}
+        extract_futures = {executor.submit(get_scraped_pages_text, pdf, idx): idx for idx in toc_page_indices}
 
         results_dict = {}
-        for future in as_completed(future_to_page):
-            page_idx = future_to_page[future]
+        for future in as_completed(extract_futures):
+            page_idx = extract_futures[future]
             results_dict[page_idx] = future.result()
         scraped_pages_text = [results_dict[i] for i in sorted(results_dict.keys())]
 
-    return [
-        match
-        for entry in toc_entries
-        if "SECTION_BREAK" not in entry[0] and not (len(entry) > MIN_TOC_ENTRY_FIELDS and str(entry[3]) == "Page")
-        if (
-            match := _find_match_for_entry(
-                entry, scraped_pages_text, length_of_coversheet if length_of_coversheet is not None else 0, length_of_frontmatter
-            )
-        )
-    ]
+        # Step 2: Parallelize the search for each TOC entry within the extracted text.
+        search_futures = {
+            executor.submit(_find_match_for_entry, entry, scraped_pages_text, length_of_coversheet, length_of_frontmatter)
+            for entry in toc_entries
+            if "SECTION_BREAK" not in entry[0] and not (len(entry) > MIN_TOC_ENTRY_FIELDS and str(entry[3]) == "Page")
+        }
+
+        # Collect valid results as they complete.
+        return [future.result() for future in as_completed(search_futures) if future.result() is not None]
+
+
+def _get_toc_creation_result(toc_future):
+    """Get the result from the TOC creation future, raising an error if it's None."""
+    result = toc_future.result()
+    if result is None:
+        raise CreateTocError("0")
+    return result
 
 
 def _assemble_final_bundle(
@@ -1552,9 +1635,9 @@ def _assemble_final_bundle(
     (
         bundle_config,
         temp_dir,
-        merged_pdf_obj,
-        toc_entries,
-        index_data,
+        merged_pdf_obj,  # Already defined
+        toc_entries,  # Already defined
+        index_data,  # Already defined
         length_of_coversheet,
         coversheet_pdf_obj,
         tmp_output_file,
@@ -1562,9 +1645,23 @@ def _assemble_final_bundle(
 
     temp_path = Path(temp_dir)
 
-    toc_file_path = temp_path / "index.pdf"  # Still needed for logging and error messages
+    (
+        merged_paginated_no_toc,
+        page_numbers_pdf,
+        page_numbers_aux,
+        page_numbers_tex,
+        toc_file_path,
+        toc_out,
+        toc_log,
+        toc_aux,
+        toc_tex,
+        merged_file_with_frontmatter,
+        hyperlinked_file,
+        main_bookmarked_file,
+        index_bookmarked_file,
+    ) = get_paths(temp_path)
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=2, initializer=init_worker, initargs=(count(1),)) as executor:
         # Submit pagination and TOC creation to run in parallel
         pagination_future = executor.submit(paginate_merged_main_files, merged_pdf_obj, bundle_config)
         toc_params = TocParams(
@@ -1575,7 +1672,7 @@ def _assemble_final_bundle(
         try:
             # Retrieve results
             paginated_pdf = pagination_future.result()
-            docx_output_path, toc_buffer, length_of_toc = toc_future.result()
+            docx_output_path, toc_buffer, length_of_toc = _get_toc_creation_result(toc_future)
         except Exception as e:
             # Handle exceptions from either task
             if isinstance(e, CreateTocError):
@@ -1619,7 +1716,21 @@ def _assemble_final_bundle(
         return None
 
     # Return the path to the docx and the list of all temp files created in this function
-    return docx_output_path, [temp_path / "pageNumbers.pdf"]
+    return docx_output_path, [
+        merged_paginated_no_toc,
+        page_numbers_pdf,
+        page_numbers_aux,
+        page_numbers_tex,
+        toc_file_path,
+        toc_out,
+        toc_log,
+        toc_aux,
+        toc_tex,
+        merged_file_with_frontmatter,
+        hyperlinked_file,
+        main_bookmarked_file,
+        index_bookmarked_file,
+    ]
 
 
 def create_bundle(input_files: list, output_file, coversheet_file, index_file, bundle_config_data: BundleConfig):
@@ -1736,7 +1847,7 @@ def create_zip_file(create_zip_file_params: CreateZipFileParams):
     int_zip_filepath = Path(temp_dir) / f"{bundle_title}_{case_name}_{timestamp}.zip"
     bundle_logger.debug(f"[CZF]Creating zip file at {int_zip_filepath}")
 
-    with zipfile.ZipFile(int_zip_filepath, "w") as zipf:
+    with zipfile.ZipFile(int_zip_filepath, cast(Any, "w")) as zipf:
         # Add input files to a subdirectory
         for file_storage in input_files:
             # Since we have the file in memory, we write its content directly
@@ -1805,7 +1916,7 @@ def main():
     )
 
     create_bundle(
-        input_files,
+        input_files,  # For CLI, this would need to be a list of file paths opened as streams
         output_file,
         coversheet,
         index_file,
