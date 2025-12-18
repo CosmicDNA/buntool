@@ -32,6 +32,7 @@
 import argparse
 import csv
 import functools
+import io
 import logging
 
 # General
@@ -101,6 +102,7 @@ def configure_logger(bundle_config, session_id=None):
     # Suppress noisy warnings from pdfminer, which is used by pdfplumber
     logging.getLogger("pdfminer.pdfinterp").setLevel(logging.ERROR)
     logging.getLogger("pdfminer.pdfpage").setLevel(logging.ERROR)
+    logging.getLogger("pdfminer.pdffont").setLevel(logging.ERROR)
 
     logs_dir = bundle_config.logs_dir if bundle_config else "logs"
 
@@ -366,33 +368,6 @@ def get_and_adjust_bookmarks(pdf: Pdf, page_offset: int) -> list[tuple[str, int,
     return adjusted_bookmarks
 
 
-def get_bookmarks(pdf: Pdf):
-    """Reads a PDF and logs its bookmarks (outline)."""
-    try:
-        if not pdf.Root.get("/Outlines"):
-            bundle_logger.info(f"No bookmarks found in {pdf.filename}")
-            return
-
-        def _traverse_outline(items, level=0):
-            """Recursively traverse and log outline items."""
-            for item in items:
-                if item.destination:
-                    try:
-                        page_obj = item.destination[0]
-                        if isinstance(page_obj, Page):
-                            page_num = pdf.pages.index(page_obj)
-                            bundle_logger.info(f"{'  ' * level}Bookmark: '{item.title}' -> Page {page_num}")
-                    except (ValueError, IndexError):
-                        bundle_logger.warning(f"{'  ' * level}Bookmark: '{item.title}' -> Invalid destination")
-                if item.children:
-                    _traverse_outline(item.children, level + 1)
-
-        with pdf.open_outline() as outline:
-            _traverse_outline(outline.root)
-    except Exception:
-        bundle_logger.exception(f"Error reading bookmarks from {pdf.filename}")
-
-
 def is_bundle(plumber_pdf: PDF) -> int:
     """Checks if a pdfplumber PDF object is a bundle by looking for a TOC."""
 
@@ -411,16 +386,30 @@ def is_bundle(plumber_pdf: PDF) -> int:
     return toc_pages_n
 
 
-def _analyze_pdf_content(file_path: Path) -> dict:
-    """Opens a PDF with pdfplumber to perform content analysis.
+def _process_pdf_file(file_path: Path) -> dict:
+    """Worker function to process a single PDF file in a thread.
 
-    Checks for blank pages and if the PDF is a nested bundle.
-    This function is designed to be run in a separate thread.
+    Opens the file with both pikepdf and pdfplumber to perform all
+    necessary analysis and preparation for merging.
     """
-    with pdfplumber.open(file_path) as plumber_pdf:
-        blank_pages = [page.page_number for page in plumber_pdf.pages if _is_page_blank(page)]
-        is_nested_bundle = is_bundle(plumber_pdf)
-    return {"blank_pages": blank_pages, "is_bundle": is_nested_bundle}
+    try:
+        src_pdf = Pdf.open(file_path)
+        with pdfplumber.open(file_path) as plumber_pdf:
+            blank_pages = [page.page_number for page in plumber_pdf.pages if _is_page_blank(page)]
+            is_nested_bundle = is_bundle(plumber_pdf)
+
+        sub_bookmarks = get_and_adjust_bookmarks(src_pdf, 0)  # Offset is adjusted later
+    except Exception as e:
+        bundle_logger.exception(f"Error processing file {file_path}")
+        return {"error": str(e), "filename": file_path.name}
+    else:
+        return {
+            "pdf": src_pdf,
+            "blank_pages": blank_pages,
+            "is_bundle": is_nested_bundle,
+            "sub_bookmarks": sub_bookmarks,
+            "filename": file_path.name,
+        }
 
 
 def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
@@ -437,61 +426,63 @@ def merge_pdfs_create_toc_entries(input_files, output_file, index_data: dict):
         - date
         - page number
     """
-    pdf = Pdf.new()
     page_counts = {"total": 0}  # Use a mutable dict to track page count across list comprehension
     tab_counts = count(1)
     section_counts = count(1)
     toc_entries = []
     all_sub_bookmarks: list = []
     is_bundle_map = {}  # To store results of is_bundle checks
-    current_page_offset = 0
-    future_to_filename = {}
+    filename_to_results = {}
 
     with ThreadPoolExecutor() as executor:
-        # Submit analysis tasks for all files that are not section breaks
-        for filename, (_, _, section) in index_data.items():
-            if section != "1":
-                file_path = next((path for path in input_files if path.name == Path(filename).name), None)
-                if file_path and file_path.exists():
-                    future = executor.submit(_analyze_pdf_content, file_path)
-                    future_to_filename[future] = filename
+        # Map filenames from index_data to actual file paths
+        file_paths_to_process = {
+            path
+            for filename in index_data
+            if index_data[filename][2] != "1" and (path := next((p for p in input_files if p.name == Path(filename).name), None))
+        }
 
-        # Process files sequentially for merging and TOC creation
-        for filename, (title, _, section) in index_data.items():
-            if section == "1":
-                toc_entries.append((f"SECTION_BREAK_{next(section_counts)}", title))
-                continue
+        # Submit all PDF processing tasks to the executor
+        future_to_path = {executor.submit(_process_pdf_file, path): path for path in file_paths_to_process}
 
-            this_file_path = next((path for path in input_files if path.name == Path(filename).name), None)
-            if not (this_file_path and this_file_path.exists()):
-                bundle_logger.warning(f"File {filename} not found. Skipping.")
-                continue
+        for future in as_completed(future_to_path):
+            result = future.result()
+            if "error" not in result:
+                filename_to_results[result["filename"]] = result
 
-            # This part must be sequential
-            with Pdf.open(this_file_path) as src_pdf:
-                toc_entry_params = TocEntryParams(
-                    item=(filename, index_data[filename]), page_counts=page_counts, pdf=src_pdf, tab_counts=tab_counts, section_counts=section_counts
-                )
-                if entry := _generate_toc_entry(toc_entry_params):
-                    toc_entries.append(entry)
+    # Now, assemble the results sequentially
+    final_pdf = Pdf.new()
+    for filename, (title, _, section) in index_data.items():
+        if section == "1":
+            toc_entries.append((f"SECTION_BREAK_{next(section_counts)}", title))
+            continue
 
-                sub_bookmarks = get_and_adjust_bookmarks(src_pdf, current_page_offset)
-                if sub_bookmarks:
-                    toc_entry = toc_entries[-1]
-                    all_sub_bookmarks.append({"parent_title": toc_entry[1], "tab": toc_entry[0], "bookmarks": sub_bookmarks})
+        result = filename_to_results.get(Path(filename).name)
 
-                pdf.pages.extend(src_pdf.pages)
-                current_page_offset += len(src_pdf.pages)
+        if not result:
+            bundle_logger.warning(f"File {filename} not found or failed to process. Skipping.")
+            continue
 
-        # Now, process the analysis results as they complete, which is non-blocking.
-        for future in as_completed(future_to_filename):
-            analysis_result = future.result()
-            filename = future_to_filename[future]
-            for page_num in analysis_result["blank_pages"]:
-                bundle_logger.warning(f"Blank page detected in '{filename}' on page {page_num}.")
-            is_bundle_map[filename] = analysis_result["is_bundle"]
+        src_pdf = result["pdf"]
 
-    pdf.save(output_file)
+        entry = _generate_toc_entry(
+            TocEntryParams(
+                item=(filename, index_data[filename]), page_counts=page_counts, pdf=src_pdf, tab_counts=tab_counts, section_counts=section_counts
+            )
+        )
+        new_toc_entries = [entry] if entry else []
+        toc_entries.extend(new_toc_entries)
+        if entry and result["sub_bookmarks"]:
+            # Adjust bookmark page numbers with the current offset
+            adjusted_sub_bookmarks = [
+                (title, page + page_counts["total"] - len(src_pdf.pages), level) for title, page, level in result["sub_bookmarks"]
+            ]
+            all_sub_bookmarks.append({"parent_title": entry[1], "tab": entry[0], "bookmarks": adjusted_sub_bookmarks})
+
+        final_pdf.pages.extend(src_pdf.pages)
+        is_bundle_map[filename] = result["is_bundle"]
+
+    final_pdf.save(output_file)
     return toc_entries, all_sub_bookmarks, is_bundle_map, page_counts["total"]
 
 
@@ -1631,14 +1622,17 @@ def save_merged_files_with_frontmaster(params: SaveMergedFilesWithFrontmasterPar
     return frontmatter_path, length_of_frontmatter
 
 
-def _calculate_hyperlink_coords(
-    merged_file_with_frontmatter: Path, length_of_coversheet: int | None, length_of_frontmatter: int, toc_entries: list
-) -> list:
-    """Calculates the coordinates for TOC hyperlinks by extracting text in parallel."""
-    bundle_logger.debug("[HYP]Starting hyperlink coordinate calculation")
-    with pdfplumber.open(merged_file_with_frontmatter) as pdf, ThreadPoolExecutor() as executor:
-        num_pages_in_plumber_pdf = len(pdf.pages)
-        bundle_logger.debug(f"[HYP]..Opened {merged_file_with_frontmatter.name} with pdfplumber. It has {num_pages_in_plumber_pdf} pages.")
+def _calculate_hyperlink_coords(pdf_in_memory: Pdf, length_of_coversheet: int | None, length_of_frontmatter: int, toc_entries: list) -> list:
+    """Calculates the coordinates for TOC hyperlinks by extracting text in parallel from an in-memory PDF object."""
+    bundle_logger.debug("[HYP]Starting hyperlink coordinate calculation from in-memory PDF")
+
+    # Create an in-memory buffer and save the pikepdf object to it
+    buffer = io.BytesIO()
+    pdf_in_memory.save(buffer)
+    buffer.seek(0)  # Rewind the buffer to the beginning
+
+    with pdfplumber.open(buffer) as pdf, ThreadPoolExecutor() as executor:
+        bundle_logger.debug(f"[HYP]..Opened in-memory PDF with pdfplumber. It has {len(pdf.pages)} pages.")
         bundle_logger.debug(f"[HYP]..Coversheet length: {length_of_coversheet}, Frontmatter length: {length_of_frontmatter}")
 
         toc_page_indices = range(length_of_coversheet if length_of_coversheet is not None else 0, length_of_frontmatter)
@@ -1740,10 +1734,9 @@ def _assemble_final_bundle(
         bundle_logger.exception("CB..Saving merged files with frontmatter failed.")
         return None
 
-    list_of_annotation_coords = _calculate_hyperlink_coords(merged_file_with_frontmatter, length_of_coversheet, length_of_frontmatter, toc_entries)
-
     try:
         with Pdf.open(merged_file_with_frontmatter, allow_overwriting_input=True) as pdf:
+            list_of_annotation_coords = _calculate_hyperlink_coords(pdf, length_of_coversheet, length_of_frontmatter, toc_entries)
             add_annotations_with_transform(pdf, list_of_annotation_coords)
             _adjust_inner_bundle_links(pdf, toc_entries, index_data, length_of_frontmatter, bundle_config.is_bundle_map)
             add_bookmarks_to_pdf(pdf, toc_entries, length_of_frontmatter, bundle_config)
@@ -1863,12 +1856,6 @@ def create_bundle(input_files, output_file, coversheet, index_file, bundle_confi
             # return tmp_output_file, None
         else:
             bundle_logger.info(f"[CB]..Zip file created at {Path(zip_filepath).name}")
-
-    # Final check of bookmarks in the output file for debugging
-    with Pdf.open(tmp_output_file) as final_pdf:
-        bundle_logger.info("=" * 20 + " FINAL BOOKMARK CHECK " + "=" * 20)
-        get_bookmarks(final_pdf)
-        bundle_logger.info("=" * 20 + " END FINAL BOOKMARK CHECK " + "=" * 20)
 
     list_of_temp_files = initial_temp_files + created_temp_files
     remaining_files = remove_temporary_files(list_of_temp_files)
