@@ -872,21 +872,21 @@ def _build_reportlab_doc_header(casedetails: dict, styleSheet: StyleSheet1, conf
 def _build_reportlab_main_table(table_data, list_of_section_breaks, col_widths):
     """Builds and styles the main TOC table for ReportLab."""
     toc_table = Table(table_data, colWidths=col_widths, repeatRows=1, cornerRadii=(5, 5, 0, 0))
-    style = TableStyle(
-        [
-            ("BACKGROUND", (0, 0), (-1, 0), colors.darkgray),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-            ("LINEBELOW", (0, 0), (-1, 0), 1, colors.black),
-            ("ALIGNMENT", (0, 0), (-1, 0), "CENTRE"),
-            ("FONTSIZE", (0, 0), (-1, 0), 12),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("BACKGROUND", (0, 1), (-1, -1), colors.white),
-            ("LINEBELOW", (0, 1), (-1, -1), 0.3, colors.black),
-        ]
-    )
-    for section_break_row in list_of_section_breaks:
-        style.add("BACKGROUND", (0, int(section_break_row)), (-1, int(section_break_row)), colors.lightgrey)
-    toc_table.setStyle(style)
+    style_commands = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.darkgray),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("LINEBELOW", (0, 0), (-1, 0), 1, colors.black),
+        ("ALIGNMENT", (0, 0), (-1, 0), "CENTRE"),
+        ("FONTSIZE", (0, 0), (-1, 0), 12),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+        ("LINEBELOW", (0, 1), (-1, -1), 0.3, colors.black),
+    ]
+
+    section_styles = [("BACKGROUND", (0, int(row)), (-1, int(row)), colors.lightgrey) for row in list_of_section_breaks]
+    style_commands.extend(section_styles)
+
+    toc_table.setStyle(TableStyle(style_commands))
     return toc_table
 
 
