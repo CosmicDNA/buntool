@@ -1854,6 +1854,10 @@ def create_zip_file(create_zip_file_params: CreateZipFileParams):
             # Since we have the file in memory, we write its content directly
             file_storage.stream.seek(0)
             zipf.writestr(f"input_files/{file_storage.filename}", file_storage.stream.read())
+        # Add index.csv if it exists
+        index_csv_path = temp_dir / "index.csv"
+        if index_csv_path.exists():
+            zipf.write(index_csv_path, "index.csv")
         # Add coversheet to the root directory
         if docx_path:
             zipf.write(docx_path, Path(docx_path).name)
