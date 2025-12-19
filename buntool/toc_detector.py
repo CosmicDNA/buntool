@@ -279,7 +279,7 @@ class TOCDetector:
                 score_and_method, words = self.extract_data(page, page_num)
             except Exception:
                 self.logger.debug(f"Skipping page {page_num}")
-                continue
+                break
 
             score, method = score_and_method
             self.logger.debug(f"Page {page_num}: Score {score:.2f} ({method})")

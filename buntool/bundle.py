@@ -1343,6 +1343,10 @@ def add_annotations_with_transform(pdf: Pdf, list_of_annotation_coords: list):
 
 
 def get_scraped_pages_text(pdf: PDF, idx: int):
+    if idx < 0 or idx >= len(pdf.pages):
+        bundle_logger.error(f"[HYP]..IndexError imminent: Requesting page {idx} but PDF has {len(pdf.pages)} pages.")
+        return []
+
     current_page = pdf.pages[idx]
     bundle_logger.debug(f"[HYP]..Processing page {idx} for TOC text extraction")
     return current_page.extract_text_lines()
@@ -1714,7 +1718,8 @@ def _calculate_hyperlink_coords(pdf_buffer: io.BytesIO, length_of_coversheet: in
 
     with PDF.open(pdf_buffer) as plumberPdf, ThreadPoolExecutor(max_workers=CPU_COUNT, initializer=init_worker, initargs=(count(1),)) as executor:
         # Step 1: Parallelize the text extraction from each TOC page.
-        bundle_logger.debug(f"[HYP]..Coversheet length: {length_of_coversheet}, Frontmatter length: {length_of_frontmatter}")
+        num_pages = len(plumberPdf.pages)
+        bundle_logger.debug(f"[HYP]..Coversheet length: {length_of_coversheet}, Frontmatter length: {length_of_frontmatter}, PDF pages: {num_pages}")
 
         toc_page_indices = range(length_of_coversheet if length_of_coversheet is not None else 0, length_of_frontmatter)
         # Pass the opened pdfplumber object to each worker
