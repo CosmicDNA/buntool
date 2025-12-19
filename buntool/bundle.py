@@ -51,6 +51,8 @@ from typing import Any, Literal, NamedTuple, cast
 
 import pdfplumber
 
+from buntool.toc_detector import ParseTocLineReturn, TOCDetector
+
 try:
     from memory_profiler import profile  # type: ignore
 except ImportError:
@@ -100,6 +102,10 @@ PAGE_WIDTH = defaultPageSize[0]  # reportlab page sizes used in more than one fu
 MIN_CSV_COLUMNS_WITH_SECTION = 4
 MIN_CSV_COLUMNS_NO_SECTION = 3
 MIN_TOC_ENTRY_FIELDS = 3
+LINK_OFFSET_MIN = -5
+LINK_OFFSET_MAX = 50
+LINK_MATCH_TOLERANCE = 2
+PAGE_NUMBER_INDEX = 3
 
 CPU_COUNT = os.cpu_count()
 
@@ -322,6 +328,165 @@ def _generate_toc_entry(toc_entry_params: TocEntryParams) -> tuple | None:
     return (tab_number, entry_title, entry_date, current_page_start)
 
 
+def _get_page_index_from_dest(pdf: Pdf, dest) -> int:
+    """Safely get the page index from a destination."""
+    page_to_find = None
+    if isinstance(dest, Page):
+        page_to_find = dest
+    elif isinstance(dest, (list, Array)) and dest:
+        page_obj_ref = dest[0]
+        # It's most likely a pikepdf.Object representing the page dictionary
+        if hasattr(page_obj_ref, "get") and page_obj_ref.get("/Type") == Name.Page:
+            page_to_find = Page(page_obj_ref)
+
+    if page_to_find:
+        try:
+            return pdf.pages.index(page_to_find)
+        except ValueError:
+            return -1
+
+    if isinstance(dest, int):
+        return dest
+
+    return -1
+
+
+def _extract_links_from_page(src_pdf: Pdf, page_num: int) -> list[tuple[float, int]]:
+    """Extract links from a specific page of the PDF."""
+    links = []
+    try:
+        pike_page = src_pdf.pages[page_num - 1]
+        annots = pike_page.get("/Annots")
+        if not annots:
+            return []
+
+        # Ensure annots is treated as iterable (Pylance fix)
+        if not isinstance(annots, (list, Array)):
+            return []
+
+        page_height = float(pike_page.mediabox[3])
+
+        for annot in cast(list[Dictionary], annots):
+            if annot.get("/Subtype") != "/Link":
+                continue
+
+            dest = annot.get("/Dest")
+            action = annot.get("/A")
+            dest_idx = -1
+
+            if dest:
+                dest_idx = _get_page_index_from_dest(src_pdf, dest)
+            elif action and action.get("/S") == "/GoTo":
+                d = action.get("/D")
+                if d:
+                    dest_idx = _get_page_index_from_dest(src_pdf, d)
+
+            if dest_idx == -1:
+                continue
+
+            rect = annot.get("/Rect")
+            if not rect:
+                continue
+
+            # Calculate center Y (from top)
+            center_y = page_height - (float(rect[3]) + float(rect[1])) / 2
+            links.append((center_y, dest_idx))
+
+        links.sort(key=lambda x: x[0])
+    except Exception:
+        bundle_logger.exception(f"Error extracting links from page {page_num}")
+    return links
+
+
+def _resolve_toc_entry_dest(entry: ParseTocLineReturn, page_links: dict[int, list[tuple[float, int]]], state: dict) -> int:
+    """Resolve the destination page index for a TOC entry."""
+    dest_page_index = -1
+
+    if entry.page is None:
+        return -1
+
+    links = page_links.get(entry.toc_page_num, [])
+    best_link_idx = -1
+
+    if links:
+        if not state["offset_calculated"]:
+            for i, (_, l_dest) in enumerate(links):
+                diff = l_dest - entry.page
+                if LINK_OFFSET_MIN <= diff <= LINK_OFFSET_MAX:
+                    state["page_offset"] = diff
+                    state["offset_calculated"] = True
+                    dest_page_index = l_dest
+                    best_link_idx = i
+                    break
+        else:
+            expected_dest = entry.page + state["page_offset"]
+            for i, (_, l_dest) in enumerate(links):
+                if abs(l_dest - expected_dest) <= LINK_MATCH_TOLERANCE:
+                    dest_page_index = l_dest
+                    best_link_idx = i
+                    break
+
+    if best_link_idx != -1:
+        page_links[entry.toc_page_num] = links[best_link_idx + 1 :]
+
+    if dest_page_index == -1:
+        dest_page_index = entry.page + state["page_offset"] if entry.page else -1
+
+    return dest_page_index
+
+
+def generate_bookmarks_from_toc_entries(src_pdf: Pdf, toc_entries: list[ParseTocLineReturn]) -> list[tuple[str, int, int]]:
+    """Generate bookmarks from TOC entries, resolving destinations via links."""
+    max_src_pages = len(src_pdf.pages)
+
+    # 1. Collect all links from the relevant TOC pages
+    toc_pages = sorted({e.toc_page_num for e in toc_entries})
+    page_links = {page_num: _extract_links_from_page(src_pdf, page_num) for page_num in toc_pages}
+
+    # 2. Match entries to links
+    state = {"page_offset": 0, "offset_calculated": False}
+
+    # bookmarks = []
+    # for entry in toc_entries:
+    #     dest_page_index = _resolve_toc_entry_dest(entry, page_links, state)
+    #     # Clamp to valid range to prevent IndexError later
+    #     if dest_page_index >= max_src_pages:
+    #         bundle_logger.warning(
+    #             f"Bookmark '{entry.title}' points to page {dest_page_index} which is out of bounds (max {max_src_pages})."
+    #             f"Treating as section header.")
+    #         dest_page_index = -1
+    #     bookmarks.append((entry.title, dest_page_index, entry.indent_level))
+
+    bookmarks = [
+        (entry.title, dest_page_index, entry.indent_level)
+        for entry in toc_entries
+        if (dest_page_index := _resolve_toc_entry_dest(entry, page_links, state)) < max_src_pages
+    ]
+
+    # 3. Fixup section breaks (dest_page_index == -1)
+    # Point them to the destination of the next valid child
+    for i in range(len(bookmarks) - 1, -1, -1):
+        title, page, level = bookmarks[i]
+        if page == -1:
+            # Find next item
+            next_page = -1
+            for j in range(i + 1, len(bookmarks)):
+                if bookmarks[j][1] != -1:
+                    next_page = bookmarks[j][1]
+                    break
+
+            # If still -1 (end of list), use last known good page? Or 0?
+            if next_page == -1 and i > 0:
+                # Try previous? No, section header should point forward.
+                pass
+
+            bookmarks[i] = (title, max(0, next_page), level)
+
+    if bookmarks:
+        bundle_logger.info(f"Generated {len(bookmarks)} bookmarks from TOC entries.")
+    return bookmarks
+
+
 def extract_bookmarks(pdf: Pdf, pdf_name_for_logging: str) -> list[tuple[str, int, int]]:
     """Reads a PDF's bookmarks and returns them as a list of (title, page_number, level) tuples."""
     extracted_bookmarks = []
@@ -338,37 +503,11 @@ def extract_bookmarks(pdf: Pdf, pdf_name_for_logging: str) -> list[tuple[str, in
                 if item.children:
                     yield from _flatten_bookmarks(item.children, level + 1)
 
-        def get_page_index_from_destination(dest):
-            """Safely get the page index from a bookmark destination."""
-            page_to_find = None
-            if isinstance(dest, Page):
-                page_to_find = dest
-            elif isinstance(dest, (list, Array)) and dest:
-                page_obj_ref = dest[0]
-                # It's most likely a pikepdf.Object representing the page dictionary
-                if hasattr(page_obj_ref, "get") and page_obj_ref.get("/Type") == Name.Page:
-                    page_to_find = Page(page_obj_ref)
-
-            if page_to_find:
-                try:
-                    return pdf.pages.index(page_to_find)
-                except ValueError:
-                    bundle_logger.warning(f"Bookmark destination page not found in {pdf_name_for_logging}")
-                    return -1
-
-            if isinstance(dest, int):
-                return dest
-
-            if dest is not None:
-                bundle_logger.debug(f"Unsupported bookmark destination type in {pdf_name_for_logging}: {type(dest)}")
-
-            return -1
-
         with pdf.open_outline() as outline:
             extracted_bookmarks = [
                 (item.title, page_index, level)
                 for item, level in _flatten_bookmarks(outline.root)
-                if (page_index := get_page_index_from_destination(item.destination)) != -1
+                if (page_index := _get_page_index_from_dest(pdf, item.destination)) != -1
             ]
 
         bundle_logger.info(f"Found {len(extracted_bookmarks)} bookmarks in {pdf_name_for_logging}")
@@ -379,10 +518,10 @@ def extract_bookmarks(pdf: Pdf, pdf_name_for_logging: str) -> list[tuple[str, in
     return extracted_bookmarks
 
 
-def is_bundle(plumber_pdf: PDF, start_page: int = 0) -> int:
+def is_buntool_bundle(plumber_pdf: PDF, start_page: int = 0) -> int:
     """Checks if a pdfplumber PDF object is a bundle by looking for a TOC."""
 
-    def is_toc_page(page: PlumberPage) -> bool:
+    def is_buntool_toc_page(page: PlumberPage) -> bool:
         table = page.extract_table()
         if table and table[0]:
             return table[0][0] == " ".join(HEADERS)
@@ -390,7 +529,7 @@ def is_bundle(plumber_pdf: PDF, start_page: int = 0) -> int:
 
     toc_pages_number = 0
     for page in plumber_pdf.pages[start_page:]:
-        if is_toc_page(page):
+        if is_buntool_toc_page(page):
             toc_pages_number += 1
         else:
             break
@@ -412,9 +551,23 @@ def _process_pdf_file(file_storage: FileStorage) -> dict:  # file_storage is a w
         src_pdf = Pdf.open(cast(io.BytesIO, file_storage.stream))
         file_storage.stream.seek(0)  # Rewind again for pdfplumber
         with pdfplumber.open(cast(io.BytesIO, file_storage.stream)) as plumber_pdf:
-            is_nested_bundle = is_bundle(plumber_pdf)
+            sub_bookmarks = extract_bookmarks(src_pdf, cast(str, file_storage.filename))
 
-        sub_bookmarks = extract_bookmarks(src_pdf, cast(str, file_storage.filename))
+            toc_page_count = is_buntool_bundle(plumber_pdf)
+
+            # If no bookmarks found, try to detect TOC and generate them
+            if toc_page_count == 0 or not sub_bookmarks:
+                td = TOCDetector(logger=bundle_logger)
+                toc_entries = td.get_full_toc(plumber_pdf)
+                if toc_entries:
+                    if toc_page_count == 0:
+                        toc_page_count = len({e.toc_page_num for e in toc_entries})
+                    if not sub_bookmarks:
+                        bundle_logger.info(f"Detected {len(toc_entries)} TOC entries. Generating bookmarks.")
+                        sub_bookmarks = generate_bookmarks_from_toc_entries(src_pdf, toc_entries)
+
+            is_nested_bundle = toc_page_count
+
     except Exception as e:
         bundle_logger.exception(f"Error processing file {file_storage.filename}")
         return {"error": str(e), "filename": file_storage.filename}
@@ -493,11 +646,23 @@ def merge_pdfs_create_toc_entries(input_files: list[FileStorage], index_data: di
             )
             new_toc_entries = [entry] if entry else []
             toc_entries.extend(new_toc_entries)
-            if entry and result["sub_bookmarks"]:
+            if entry and (result["sub_bookmarks"] or result.get("is_bundle", 0) > 0):
                 # Adjust bookmark page numbers with the current offset
-                adjusted_sub_bookmarks = [
-                    (title, page + page_counts["total"] - len(src_pdf.pages), level) for title, page, level in result["sub_bookmarks"]
-                ]
+                start_page = entry[3]
+                adjusted_sub_bookmarks = []
+                if result["sub_bookmarks"]:
+                    adjusted_sub_bookmarks = [(title, page + start_page, level) for title, page, level in result["sub_bookmarks"]]
+
+                if result.get("is_bundle", 0) > 0:
+                    has_index = False
+                    if adjusted_sub_bookmarks:
+                        first_bm = adjusted_sub_bookmarks[0]
+                        if first_bm[1] == start_page and first_bm[0].lower() in ("index", "table of contents", "contents"):
+                            has_index = True
+
+                    if not has_index:
+                        adjusted_sub_bookmarks.insert(0, ("Index", start_page, 0))
+
                 all_sub_bookmarks.append({"parent_title": entry[1], "tab": entry[0], "bookmarks": adjusted_sub_bookmarks})
 
             final_pdf.pages.extend(src_pdf.pages)
@@ -506,10 +671,10 @@ def merge_pdfs_create_toc_entries(input_files: list[FileStorage], index_data: di
     return final_pdf, toc_entries, all_sub_bookmarks, is_bundle_map, page_counts["total"]
 
 
-def _create_bookmark_item(entry, length_of_frontmatter, bundle_config: BundleConfig):
+def _create_bookmark_item(entry, destination_page, bundle_config: BundleConfig):
     """Creates a single OutlineItem for a TOC entry based on bookmark settings."""
-    tab_number, title, date, page = entry
-    destination_page = page + length_of_frontmatter
+    tab_number, title, date, _ = entry
+    # destination_page is passed in
     setting = bundle_config.bookmark_setting
 
     if setting == "tab-title":
@@ -528,7 +693,7 @@ def _create_bookmark_item(entry, length_of_frontmatter, bundle_config: BundleCon
     return OutlineItem(label, destination_page)
 
 
-def _add_sub_bookmarks(parent_bookmark: OutlineItem, bookmarks_to_add, length_of_frontmatter):
+def _add_sub_bookmarks(parent_bookmark: OutlineItem, bookmarks_to_add, length_of_frontmatter, max_pages):
     """Reconstructs and adds a hierarchical group of sub-bookmarks under a parent."""
     level_map = {0: parent_bookmark}
     for title, page_num, level in bookmarks_to_add:
@@ -542,6 +707,8 @@ def _add_sub_bookmarks(parent_bookmark: OutlineItem, bookmarks_to_add, length_of
 
         if parent_for_current_item:
             final_page_num = page_num + length_of_frontmatter
+            if final_page_num >= max_pages:
+                final_page_num = max_pages - 1
             new_item = OutlineItem(title, final_page_num)
             parent_for_current_item.children.append(new_item)
             # Store this new item in the map at its own level,
@@ -551,7 +718,7 @@ def _add_sub_bookmarks(parent_bookmark: OutlineItem, bookmarks_to_add, length_of
             bundle_logger.warning(f"Could not find parent for sub-bookmark '{title}' at level {level}.")
 
 
-def _process_all_sub_bookmarks(main_bookmark_map, all_sub_bookmarks, length_of_frontmatter):
+def _process_all_sub_bookmarks(main_bookmark_map, all_sub_bookmarks, length_of_frontmatter, max_pages):
     """Iterates through all sub-bookmark groups and adds them to the main outline map."""
     if not all_sub_bookmarks:
         return
@@ -565,20 +732,7 @@ def _process_all_sub_bookmarks(main_bookmark_map, all_sub_bookmarks, length_of_f
         # Find the parent OutlineItem in the main TOC
         parent_bookmark = main_bookmark_map.get(f"{tab} {parent_title}")
         if parent_bookmark:
-            _add_sub_bookmarks(parent_bookmark, bookmarks_to_add, length_of_frontmatter)
-
-
-def _create_section_bookmark(entry, toc_entries, length_of_frontmatter):
-    """Creates an OutlineItem for a section break."""
-    PAGE_NUMBER_INDEX = 3
-    # Sections don't have a page destination, so we use the page of the next item.
-    # pikepdf requires a destination, so we'll find the next item's page.
-    next_item_index = toc_entries.index(entry) + 1
-    destination_page = 0  # Default destination
-    if next_item_index < len(toc_entries) and len(toc_entries[next_item_index]) > PAGE_NUMBER_INDEX:
-        destination_page = toc_entries[next_item_index][PAGE_NUMBER_INDEX] + length_of_frontmatter
-
-    return OutlineItem(entry[1], destination_page)
+            _add_sub_bookmarks(parent_bookmark, bookmarks_to_add, length_of_frontmatter, max_pages)
 
 
 def add_bookmarks_to_pdf(pdf: Pdf, toc_entries: list, length_of_frontmatter: int, bundle_config: BundleConfig):
@@ -595,20 +749,35 @@ def add_bookmarks_to_pdf(pdf: Pdf, toc_entries: list, length_of_frontmatter: int
         "tab-title-date-page
     """
     with pdf.open_outline() as outline:
+        max_pages = len(pdf.pages)
+        bundle_logger.info(f"[ABTP] Adding bookmarks. PDF has {max_pages} pages. Frontmatter length: {length_of_frontmatter}")
         current_section_bookmark = None
         main_bookmark_map = {}
 
-        for entry in toc_entries:
+        for i, entry in enumerate(toc_entries):
             # Skip the header row if it's present in toc_entries
             if "tab" in str(entry[0]).lower() and "title" in str(entry[1]).lower():
                 continue
 
             if "SECTION_BREAK" in entry[0]:
-                current_section_bookmark = _create_section_bookmark(entry, toc_entries, length_of_frontmatter)
+                dest_page = 0
+                if i + 1 < len(toc_entries) and len(toc_entries[i + 1]) > PAGE_NUMBER_INDEX:
+                    dest_page = toc_entries[i + 1][PAGE_NUMBER_INDEX] + length_of_frontmatter
+
+                if dest_page >= max_pages:
+                    bundle_logger.error(f"[ABTP] Section '{entry[1]}' destination {dest_page} exceeds max pages {max_pages}")
+                    dest_page = max_pages - 1 if max_pages > 0 else 0
+
+                current_section_bookmark = OutlineItem(entry[1], dest_page)
                 outline.root.append(current_section_bookmark)
             else:
                 # This is a file entry.
-                bookmark_item = _create_bookmark_item(entry, length_of_frontmatter, bundle_config)
+                dest_page = entry[PAGE_NUMBER_INDEX] + length_of_frontmatter
+                if dest_page >= max_pages:
+                    bundle_logger.error(f"[ABTP] Entry '{entry[1]}' destination {dest_page} exceeds max pages {max_pages}")
+                    dest_page = max_pages - 1 if max_pages > 0 else 0
+
+                bookmark_item = _create_bookmark_item(entry, dest_page, bundle_config)
                 main_bookmark_map[f"{entry[0]} {entry[1]}"] = bookmark_item
                 if current_section_bookmark:
                     current_section_bookmark.children.append(bookmark_item)
@@ -616,7 +785,7 @@ def add_bookmarks_to_pdf(pdf: Pdf, toc_entries: list, length_of_frontmatter: int
                     outline.root.append(bookmark_item)
 
         # Now, add the sub-bookmarks under their correct parent in the main TOC
-        _process_all_sub_bookmarks(main_bookmark_map, bundle_config.all_sub_bookmarks, length_of_frontmatter)
+        _process_all_sub_bookmarks(main_bookmark_map, bundle_config.all_sub_bookmarks, length_of_frontmatter, max_pages)
 
 
 def bookmark_the_index(pdf: Pdf, coversheet_pdf_obj: Pdf | None = None):
@@ -1160,7 +1329,7 @@ def add_annotations_with_transform(pdf: Pdf, list_of_annotation_coords: list):
                         Subtype=Name.Link,
                         Rect=Rectangle(*transform_coordinates(details["coords"], page_height)),
                         Border=[0, 0, 0],
-                        Dest=[pdf.pages[details["destination_page"]].obj, Name.Fit],
+                        A=Dictionary(S=Name.GoTo, D=[pdf.pages[details["destination_page"]].obj, Name.Fit]),
                     )
                     for details in annotation_group
                 ]
@@ -1436,14 +1605,18 @@ def _adjust_inner_bundle_links(pdf: Pdf, toc_entries: list, index_data: dict, le
             # These pages are located at the beginning of where the inner bundle was placed.
             for i in range(num_toc_pages):
                 page_to_adjust: Page = pdf.pages[final_start_page + i]
-                annots = cast(list[Dictionary], page_to_adjust.get("/Annots"))
-                for annot in annots or []:
-                    if annot.get("/Subtype") == "/Link" and annot.Dest:
-                        # The destination is an indirect object. We can't just add to it.
-                        # We need to find the original destination page index and create a new destination.
-                        original_dest_page_obj = cast(Page, annot.Dest[0])
-                        new_dest_page_index = pdf.pages.index(original_dest_page_obj)
-                        annot.Dest = Array([pdf.pages[new_dest_page_index].obj, Name.Fit])
+                annots = cast(list[Dictionary], page_to_adjust.get("/Annots")) or []
+                for j, annot in enumerate(annots):
+                    if annot.get("/Subtype") == "/Link":
+                        try:
+                            if annot.Dest:
+                                # The destination is an indirect object. We can't just add to it.
+                                # We need to find the original destination page index and create a new destination.
+                                original_dest_page_obj = cast(Page, annot.Dest[0])
+                                new_dest_page_index = pdf.pages.index(original_dest_page_obj)
+                                annot.Dest = Array([pdf.pages[new_dest_page_index].obj, Name.Fit])
+                        except Exception:
+                            bundle_logger.debug(f"No need to adjust relative link {j} on page {i + 1}")
 
 
 class AssembleFinalBundleParams(NamedTuple):
