@@ -13,6 +13,11 @@ from flask import Flask, current_app, jsonify, render_template, request, send_fi
 from waitress import serve
 from werkzeug.datastructures import FileStorage
 
+try:
+    from flask_livereload import LiveReload
+except ImportError:
+    LiveReload = None
+
 from buntool import bundle
 from buntool.bundle_config import BundleConfigParams
 
@@ -292,6 +297,12 @@ def create_app():
     bundles_dir = Path(tempfile.gettempdir()) / "buntool" / "bundles"
     bundles_dir.mkdir(parents=True, exist_ok=True)
 
+    if os.environ.get("BUNTOOL_DEV") and LiveReload:
+        app.config["TEMPLATES_AUTO_RELOAD"] = True
+        app.jinja_env.auto_reload = True
+        LiveReload(app)
+        app.logger.info("LiveReload enabled")
+
     with app.app_context():
         # Import and register routes within the app context
         @app.route("/")
@@ -317,8 +328,15 @@ def main():
     port = int(os.environ.get("BUNTOOL_PORT", "7001"))
 
     created_app.logger.info("buntool starting...")
-    created_app.logger.debug(f"APP - Server started on {host}:{port}.")
-    serve(created_app, host=host, port=port, threads=4, connection_limit=100, channel_timeout=120)
+
+    if os.environ.get("BUNTOOL_DEV"):
+        if LiveReload is None:
+            created_app.logger.warning("BUNTOOL_DEV is set but flask-livereload is not installed. Live reload will not work.")
+        created_app.logger.info(f"APP - Starting in DEVELOPMENT mode on {host}:{port}")
+        created_app.run(host=host, port=port, debug=True)  # nosec B201
+    else:
+        created_app.logger.info(f"APP - Server started on {host}:{port} (Production/Waitress).")
+        serve(created_app, host=host, port=port, threads=4, connection_limit=100, channel_timeout=120)
 
 
 if __name__ == "__main__":
